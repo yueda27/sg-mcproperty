@@ -221,3 +221,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw downloaded datasets (large, reproducible)
+/data/*
+!/data/.gitkeep
+
+output/*
+.vscode/*
