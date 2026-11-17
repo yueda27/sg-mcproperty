@@ -1,4 +1,6 @@
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -33,10 +35,9 @@ class URAClient:
         if not self._access_key:
             raise URAError("URA access key missing: set URA_ACCESS_KEY")
         self._token: str | None = None
+        self._auth_lock = threading.Lock()
         self._session = requests.Session()
-        self._session.headers.update(
-            {"AccessKey": self._access_key, "User-Agent": "sg-mcproperty"}
-        )
+        self._session.headers.update({"AccessKey": self._access_key, "User-Agent": "sg-mcproperty"})
 
     def __enter__(self) -> "URAClient":
         return self
@@ -71,6 +72,7 @@ class URAClient:
         Extra keyword args are passed as query parameters (e.g. ``batch=1``).
         """
         query = {"service": service, **params}
+        stale_token = self.token
         try:
             payload = self._get_data(query)
         except URAError as exc:
@@ -78,7 +80,10 @@ class URAClient:
             if "token" not in str(exc).lower():
                 raise
             logger.warning("URA token rejected, refreshing")
-            self.authenticate()
+            with self._auth_lock:
+                # Another thread may already have refreshed it while we waited.
+                if self._token == stale_token:
+                    self.authenticate()
             payload = self._get_data(query)
         return payload.get("Result") or []
 
@@ -89,11 +94,17 @@ class URAClient:
     ) -> list[dict[str, Any]]:
         """Private residential transactions, last 5 years. One project per element,
         each with a nested ``transaction`` list (``contractDate`` is ``mmyy``)."""
-        projects: list[dict[str, Any]] = []
-        for batch in batches:
+        self.token  # authenticate once up front so threads don't race to get tokens
+
+        def fetch_batch(batch: int) -> list[dict[str, Any]]:
             logger.info(f"Fetching URA private transactions batch {batch}")
-            projects.extend(self.fetch("PMI_Resi_Transaction", batch=batch))
-        return projects
+            return self.fetch("PMI_Resi_Transaction", batch=batch)
+
+        # Batches are independent, so fetch them concurrently (I/O bound). map()
+        # preserves batch order and re-raises the first failure.
+        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+            results = list(pool.map(fetch_batch, batches))
+        return [project for result in results for project in result]
 
     def rental_contracts(self, ref_period: str) -> list[dict[str, Any]]:
         """Private residential rental contracts for a quarter, e.g. ``"24q1"``."""
@@ -130,7 +141,5 @@ class URAClient:
 
         status = payload.get("Status")
         if status != "Success":
-            raise URAError(
-                f"URA returned status={status!r}, message={payload.get('Message')!r}"
-            )
+            raise URAError(f"URA returned status={status!r}, message={payload.get('Message')!r}")
         return payload

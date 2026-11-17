@@ -1,17 +1,37 @@
-"""`sg-property-load <dataset> <path>` entry point."""
+"""`sg-property-load <dataset> [--dump]` entry point."""
 
 import argparse
-from pathlib import Path
 
-from . import hdb_resale
+from sg_mcproperty.loaders.utils import dump_file
 
-#LOADERS = {"hdb-resale": hdb_resale.load}  # register new loaders here
+from . import private_residential
+
+LOADERS = {
+    "private-residential": {
+        "function": private_residential.load,
+        "filename": "private_residential.parquet",
+    }
+}
+
+
+def run_loader(loader_func, file_name: str, write_file: bool = False):
+    df = loader_func()
+    if write_file:
+        dump_file(df, file_name)
+    return df
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="sg-property-load")
     parser.add_argument("dataset", choices=sorted(LOADERS))
-    parser.add_argument("path", type=Path, help="source file, typically under data/")
+    parser.add_argument(
+        "--dump", action="store_true", help="write the result to output/ as parquet"
+    )
     args = parser.parse_args()
-    rows = LOADERS[args.dataset](args.path)
-    print(f"Loaded {rows} rows from {args.path}")
+    loader = LOADERS[args.dataset]
+    df = run_loader(loader["function"], loader["filename"], args.dump)
+    print(f"Loaded {df.height} rows for {args.dataset}")
+
+
+if __name__ == "__main__":
+    main()

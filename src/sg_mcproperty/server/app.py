@@ -12,7 +12,6 @@ mcp = FastMCP(
 )
 
 
-
 def main() -> None:
     mcp.run()  # stdio by default
 
