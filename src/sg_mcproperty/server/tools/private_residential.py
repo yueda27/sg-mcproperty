@@ -3,15 +3,28 @@
 Signatures and docstrings here are the schema the LLM sees. No SQL and no business rules:
 validation, limits and queries live in `sg_mcproperty.server.private_residential`.
 
-Planned tools: rank_projects, affordability_search.
+Tools that need information the caller did not supply use `server.elicitation.ask`, which
+works on both MCP protocol eras. Those tools are typed `Result | InputRequiredResult`.
+
+Planned tool: rank_projects.
 """
 
-from fastmcp import FastMCP
+from dataclasses import dataclass, field, make_dataclass
+from typing import Literal
 
+from fastmcp import Context, FastMCP
+from fastmcp.exceptions import ToolError
+from mcp.types import InputRequiredResult
+
+from sg_mcproperty.server.elicitation import ask
 from sg_mcproperty.server.private_residential import (
+    AffordabilityQuery,
+    AffordabilityResult,
     DatasetInfo,
+    GrowthQuery,
     MarketActivity,
     NearbyComparison,
+    NearbyGrowth,
     NearbyQuery,
     PriceTrend,
     PrivateResidentialService,
@@ -22,6 +35,181 @@ from sg_mcproperty.server.private_residential import (
     ValuationQuery,
     ValueEstimate,
 )
+
+
+@dataclass
+class UnitDetails:
+    """What estimate_value asks for when it has no unit size."""
+
+    area_sqft: float = field(
+        metadata={"title": "Unit size (sqft)", "description": "Floor area in square feet"}
+    )
+    floor: int = field(
+        default=0,
+        metadata={
+            "title": "Floor",
+            "description": "Floor number; 0 means typical floor for the project",
+        },
+    )
+    type_of_sale: Literal["Resale", "New Sale"] = field(
+        default="Resale",
+        metadata={"description": "Resale, or New Sale for a unit bought from the developer"},
+    )
+
+
+def _comparison_basis_form(
+    type_of_sale: str | None, same_tenure_type: bool, lease_year_tolerance: int | None
+):
+    """Comparison basis, pre-filled with whatever the caller already passed."""
+    sales = ("Resale", "New Sale", "Sub Sale")
+    sale = next(
+        (name for name in sales if name.casefold() == (type_of_sale or "").casefold()), "Any"
+    )
+    return make_dataclass(
+        "ComparisonBasis",
+        [
+            (
+                "type_of_sale",
+                Literal["Resale", "New Sale", "Sub Sale", "Any"],
+                field(
+                    default=sale,
+                    metadata={"description": "New launch and resale prices differ"},
+                ),
+            ),
+            (
+                "same_tenure_type",
+                bool,
+                field(
+                    default=same_tenure_type,
+                    metadata={"description": "Only compare freehold with freehold, etc."},
+                ),
+            ),
+            (
+                "lease_year_tolerance",
+                int,
+                field(
+                    default=lease_year_tolerance or 0,
+                    metadata={
+                        "description": "Match lease start within this many years; 0 = no filter"
+                    },
+                ),
+            ),
+        ],
+    )
+
+
+def _growth_scope_form(
+    radius_m: int,
+    max_peers: int,
+    months: int,
+    min_area_sqft: float | None,
+    max_area_sqft: float | None,
+    min_transactions: int,
+    tenure: str,
+):
+    """Scan scope, pre-filled with whatever the caller already passed."""
+    tenures = ("any", "freehold", "999 years", "freehold or 999 years")
+    return make_dataclass(
+        "GrowthScanScope",
+        [
+            ("radius_m", int, field(default=radius_m, metadata={"title": "Radius (m)"})),
+            ("max_peers", int, field(default=max_peers, metadata={"title": "Nearest projects"})),
+            ("months", int, field(default=months, metadata={"title": "Window (months)"})),
+            (
+                "tenure",
+                Literal["any", "freehold", "999 years", "freehold or 999 years"],
+                field(
+                    default=tenure if tenure in tenures else "any",
+                    metadata={"description": "Tenure filter"},
+                ),
+            ),
+            (
+                "min_area_sqft",
+                float,
+                field(default=min_area_sqft or 0, metadata={"description": "0 = no minimum"}),
+            ),
+            (
+                "max_area_sqft",
+                float,
+                field(default=max_area_sqft or 0, metadata={"description": "0 = no maximum"}),
+            ),
+            (
+                "min_transactions",
+                int,
+                field(
+                    default=min_transactions,
+                    metadata={"description": "Resales a project needs before it is ranked"},
+                ),
+            ),
+        ],
+    )
+
+
+def _affordability_form(
+    max_price: float | None, district: int | None, segment: str, min_area_sqft: float | None
+):
+    """Budget and loan assumptions, pre-filled with whatever the caller already passed."""
+    segments = ("non-landed", "ec", "landed", "strata-landed")
+    return make_dataclass(
+        "AffordabilityProfile",
+        [
+            (
+                "max_price",
+                float,
+                field(
+                    default=max_price or 0,
+                    metadata={
+                        "title": "Budget (SGD)",
+                        "description": "Total purchase price; 0 = work it out from income",
+                    },
+                ),
+            ),
+            (
+                "monthly_income",
+                float,
+                field(
+                    default=0,
+                    metadata={
+                        "title": "Gross monthly income (SGD)",
+                        "description": "Used only when budget is 0",
+                    },
+                ),
+            ),
+            (
+                "down_payment_pct",
+                float,
+                field(default=25, metadata={"description": "Cash plus CPF down payment, %"}),
+            ),
+            (
+                "loan_tenure_years",
+                int,
+                field(default=25, metadata={"description": "Mortgage term in years"}),
+            ),
+            (
+                "stress_rate_pct",
+                float,
+                field(default=4.0, metadata={"description": "Interest rate used for the test"}),
+            ),
+            (
+                "district",
+                int,
+                field(default=district or 0, metadata={"description": "Postal district; 0 = all"}),
+            ),
+            (
+                "segment",
+                Literal["non-landed", "ec", "landed", "strata-landed"],
+                field(
+                    default=segment if segment in segments else "non-landed",
+                    metadata={"description": "Property group"},
+                ),
+            ),
+            (
+                "min_area_sqft",
+                float,
+                field(default=min_area_sqft or 0, metadata={"description": "0 = any size"}),
+            ),
+        ],
+    )
 
 
 def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
@@ -160,8 +348,9 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         return service.price_trend(filters, period)
 
     @mcp.tool
-    def compare_nearby(
+    async def compare_nearby(
         project: str,
+        ctx: Context,
         radius_m: int = 1000,
         months: int = 12,
         type_of_sale: str | None = None,
@@ -169,7 +358,8 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         same_tenure_type: bool = False,
         max_peers: int = 10,
         lease_year_tolerance: int | None = None,
-    ) -> NearbyComparison:
+        ask_basis: bool = False,
+    ) -> NearbyComparison | InputRequiredResult:
         """Compare one project's price per sqft (psf) with similar projects nearby, to value it.
 
         Finds projects of the same property type within `radius_m` metres, then compares
@@ -197,6 +387,9 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
                 within this many years of the project's (0-60), e.g. 10. Age is a big driver
                 of psf, so use it when peers are much older or newer. Ignored for freehold
                 projects. Default: no age filter.
+            ask_basis: Set true when the user has not said which sale type to compare, or
+                whether to match tenure type and age. The tool asks them first; declining
+                keeps the arguments above.
 
         Returns: basis ("radius", or "street" then "district" when the project has no coordinates,
         which is common for new launches: peers are then the busiest projects on the same street
@@ -211,6 +404,24 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         with warnings such as small samples or tenure mismatches. Any value can be null when
         there is no data.
         """
+        if ask_basis:
+            form = _comparison_basis_form(type_of_sale, same_tenure_type, lease_year_tolerance)
+            answer = await ask(
+                ctx,
+                "comparison_basis",
+                "How should the comparison be set up? New launch and resale prices differ, and "
+                "tenure and project age move psf a lot.",
+                form,
+            )
+            if answer.pending is not None:
+                return answer.pending
+            if answer.value is not None:
+                type_of_sale = (
+                    None if answer.value.type_of_sale == "Any" else answer.value.type_of_sale
+                )
+                same_tenure_type = answer.value.same_tenure_type
+                lease_year_tolerance = answer.value.lease_year_tolerance or None
+
         query = NearbyQuery.from_inputs(
             project,
             radius_m,
@@ -222,6 +433,177 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
             lease_year_tolerance,
         )
         return service.compare_nearby(query)
+
+    @mcp.tool
+    async def rank_nearby_growth(
+        project: str,
+        ctx: Context,
+        radius_m: int = 2000,
+        months: int = 60,
+        min_area_sqft: float | None = None,
+        max_area_sqft: float | None = None,
+        max_peers: int = 50,
+        min_transactions: int = 4,
+        segment: str = "non-landed",
+        tenure: str = "any",
+        ask_scope: bool = False,
+    ) -> NearbyGrowth | InputRequiredResult:
+        """Rank the nearest projects by psf growth, to find neighbours that grew faster.
+
+        Scans the nearest `max_peers` projects (by SVY21 distance, so a project without
+        coordinates cannot be scanned) and fits each one's annualised psf trend over the
+        window, using only Resale and Sub Sale units. Use it for "which projects near X have
+        grown faster?" and then compare_nearby or estimate_value on the winners. Growth is a
+        recorded-price trend, not a forecast.
+
+        Args:
+            project: Exact project name, case-insensitive.
+            radius_m: Search radius in metres, 100-3000 (default 2000).
+            months: Window in months ending at the latest data month, 1-60 (default 60).
+            min_area_sqft: Minimum unit area in sqft for like-for-like psf (optional).
+            max_area_sqft: Maximum unit area in sqft (optional).
+            max_peers: Number of nearest projects to scan, 1-50 (default 50).
+            min_transactions: Resales a project needs in the band before it is ranked
+                (1-50, default 4). Projects below it are returned after the ranked ones and
+                are not ranked.
+            segment: Property group: "non-landed" (default), "ec", "landed" or
+                "strata-landed". Do not mix landed and non-landed psf.
+            tenure: "any" (default), "freehold", "999 years" or "freehold or 999 years".
+            ask_scope: Set true when the user has not fixed the radius, peer count, window,
+                tenure or size band. The tool asks first; declining keeps the arguments above.
+
+        Returns: target (the project's own stats and annual_growth_pct), peers (nearest
+        projects; ranked ones first, highest growth first, then the rest by distance), each
+        with distance_m, transactions, median_psf, median_price, annual_growth_pct and
+        better_than_target; window_start, window_end, radius_m, size_band, tenure_filter;
+        projects_compared (peers with a usable trend), insufficient_data (peers returned
+        without one) and notes. annual_growth_pct is the annualised psf trend, fitted by
+        regressing log psf on time: 4.5 means +4.5% a year. It is null when a project has
+        fewer than 3 resales in the band.
+        """
+        if ask_scope:
+            form = _growth_scope_form(
+                radius_m,
+                max_peers,
+                months,
+                min_area_sqft,
+                max_area_sqft,
+                min_transactions,
+                tenure,
+            )
+            answer = await ask(
+                ctx,
+                "growth_scope",
+                "Confirm the growth scan before it runs: distance, number of projects, window, "
+                "tenure and unit-size band.",
+                form,
+            )
+            if answer.pending is not None:
+                return answer.pending
+            if answer.value is not None:
+                scope = answer.value
+                radius_m = scope.radius_m
+                max_peers = scope.max_peers
+                months = scope.months
+                tenure = scope.tenure
+                min_area_sqft = scope.min_area_sqft or None
+                max_area_sqft = scope.max_area_sqft or None
+                min_transactions = scope.min_transactions
+
+        query = GrowthQuery.from_inputs(
+            project,
+            radius_m,
+            months,
+            max_peers,
+            min_transactions,
+            min_area_sqft,
+            max_area_sqft,
+            segment,
+            tenure,
+        )
+        return service.rank_nearby_growth(query)
+
+    @mcp.tool
+    async def affordability_search(
+        ctx: Context,
+        max_price: float | None = None,
+        district: int | None = None,
+        segment: str = "non-landed",
+        min_area_sqft: float | None = None,
+        min_transactions: int = 3,
+        limit: int = 20,
+        ask_profile: bool = False,
+    ) -> AffordabilityResult | InputRequiredResult:
+        """Find projects with recent sales inside a budget, dearest median price first.
+
+        Use it for "what can I afford?" questions. Pass `max_price` when the user gave a
+        budget, or leave it out and the tool asks for a budget or a monthly income plus loan
+        assumptions. The borrowing capacity is illustrative: it counts 55% of gross monthly
+        income at the stress rate and grosses up for the down payment, ignoring existing
+        debts, stamp duty, legal fees and renovation. It is not a loan offer.
+
+        Args:
+            max_price: Total purchase price in SGD. Omit to be asked, or to compute it from
+                monthly income.
+            district: Postal district, 1-28. Omit for all districts.
+            segment: "non-landed" (default), "ec", "landed" or "strata-landed".
+            min_area_sqft: Minimum unit area in sqft (optional).
+            min_transactions: Sales a project needs inside the budget before it is listed,
+                1-50 (default 3).
+            limit: Max projects to return, 1-50 (default 20).
+            ask_profile: Set true to confirm the budget and loan assumptions even when a
+                budget was passed. The tool asks first; declining keeps the arguments.
+
+        Returns: max_price (the budget used), assumptions (the income, down payment, loan
+        tenure, stress rate and 55% TDSR used; null when a budget was passed directly),
+        filters (district, segment, min_area_sqft), projects (each with street, district,
+        transactions inside the budget, median and minimum price, median psf and area range,
+        highest median price first) and notes. Sales are the last 5 years; prices are SGD and
+        areas sqft.
+        """
+        assumptions = None
+        if ask_profile or max_price is None:
+            form = _affordability_form(max_price, district, segment, min_area_sqft)
+            answer = await ask(
+                ctx,
+                "affordability",
+                "What is the budget, or the gross monthly income and loan assumptions to work "
+                "one out? All figures are in SGD.",
+                form,
+            )
+            if answer.pending is not None:
+                return answer.pending
+            if answer.value is None:
+                raise ToolError(
+                    "A budget or a monthly income is needed to search; pass max_price or "
+                    "retry the form."
+                )
+            profile = answer.value
+            district = profile.district or None
+            segment = profile.segment
+            min_area_sqft = profile.min_area_sqft or None
+            max_price = profile.max_price or None
+            if max_price is None:
+                if profile.monthly_income <= 0:
+                    raise ToolError(
+                        "The form needs either a budget or a positive gross monthly income."
+                    )
+                max_price, assumptions = service.income_budget(
+                    profile.monthly_income,
+                    profile.down_payment_pct,
+                    profile.loan_tenure_years,
+                    profile.stress_rate_pct,
+                )
+
+        query = AffordabilityQuery.from_inputs(
+            max_price,
+            district,
+            segment,
+            min_area_sqft,
+            min_transactions,
+            limit,
+        )
+        return service.affordability_search(query, assumptions)
 
     @mcp.tool
     def dataset_info() -> DatasetInfo:
@@ -313,15 +695,16 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         return service.market_activity(filters, period)
 
     @mcp.tool
-    def estimate_value(
+    async def estimate_value(
         project: str,
-        area_sqft: float,
+        ctx: Context,
+        area_sqft: float | None = None,
         floor: int | None = None,
         type_of_sale: str | None = None,
         radius_m: int = 1500,
         months: int = 24,
         max_peers: int = 12,
-    ) -> ValueEstimate:
+    ) -> ValueEstimate | InputRequiredResult:
         """Estimate what a unit in a project would sell for, with a range, using regression.
 
         Fits a regression of log price on recent sales of the project and similar projects
@@ -330,13 +713,15 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         freehold when the project has too few sales of its own. It then predicts the price of the
         unit described by the arguments at the latest month of data.
 
-        Two modes (model.mode). "project": the project has at least 5 sales of its own, so each
-        project gets its own price level and size, floor, sale-type and trend effects are learned
-        from variation within projects; the estimate sits at this project's own price level.
-        "area": the project has too few sales, so the model compares across projects and the
-        estimate reflects the surrounding area. Its lease and freehold effects are less
-        reliable because they can be confounded with project quality. Use search_projects first
-        to get the exact project name. Prices are SGD and areas sqft.
+        If `area_sqft` is omitted, the tool first asks for the unit size, floor and sale type
+        (declining is an error, because there is nothing to value). Two modes (model.mode).
+        "project": the project has at least 5 sales of its own, so each project gets its own
+        price level and size, floor, sale-type and trend effects are learned from variation
+        within projects; the estimate sits at this project's own price level. "area": the
+        project has too few sales, so the model compares across projects and the estimate
+        reflects the surrounding area. Its lease and freehold effects are less reliable because
+        they can be confounded with project quality. Use search_projects first to get the exact
+        project name. Prices are SGD and areas sqft.
 
         This is a statistical estimate from recorded prices, not a formal valuation: it cannot
         see view, facing, renovation or the exact unit. Always show the user the range, the
@@ -345,8 +730,8 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
 
         Args:
             project: Exact project name, case-insensitive.
-            area_sqft: Size of the unit in square feet, required. Sales from half to double
-                this size are used.
+            area_sqft: Size of the unit in square feet. Sales from half to double this size
+                are used. Omit and the tool asks for it.
             floor: Floor of the unit, 1-100. Default: the floor typically sold in the project.
                 Ignored for landed property, which has no floor.
             type_of_sale: "New Sale" or "Resale" ("Sub Sale" is treated like resale). Default
@@ -371,6 +756,25 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         used) and notes (warnings: small sample, weak fit, extrapolation, no project-specific
         effect). Large gaps between estimate and comparable_check mean the estimate is shaky.
         """
+        if area_sqft is None:
+            answer = await ask(
+                ctx,
+                "unit_details",
+                "What unit should be valued? Give its size, floor and sale type.",
+                UnitDetails,
+            )
+            if answer.pending is not None:
+                return answer.pending
+            if answer.value is None:
+                raise ToolError(
+                    "A unit size is required to estimate a value; pass area_sqft or answer "
+                    "the form."
+                )
+            area_sqft = answer.value.area_sqft
+            floor = floor if floor is not None else (answer.value.floor or None)
+            if type_of_sale is None:
+                type_of_sale = answer.value.type_of_sale
+
         query = ValuationQuery.from_inputs(
             project, area_sqft, floor, type_of_sale, radius_m, months, max_peers
         )

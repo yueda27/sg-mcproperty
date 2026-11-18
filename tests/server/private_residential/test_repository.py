@@ -1,12 +1,14 @@
 from datetime import date
 
 from sg_mcproperty.server.private_residential import (
+    AffordabilityQuery,
+    GrowthQuery,
     PrivateResidentialRepository,
     TransactionFilters,
 )
 from sg_mcproperty.server.private_residential.filters import PeerFilters
 
-from .helpers import FakeAccessor, project_row, transaction_row
+from .helpers import FakeAccessor, project_growth_row, project_row, transaction_row
 
 
 def test_repository_project_search_sql_and_params():
@@ -215,3 +217,84 @@ def test_valuation_sample_user_input_stays_in_parameters():
     )
     sql, params = accessor.calls[0]
     assert "DROP" not in sql and params["projects"] == ["x'; DROP TABLE t; --"]
+
+
+# --- growth scan and affordability --------------------------------------------------------------
+
+
+def test_nearby_growth_parameterises_distance_band_and_tenure():
+    accessor = FakeAccessor([])
+    query = GrowthQuery.from_inputs(
+        "TARGET",
+        max_peers=50,
+        months=60,
+        min_area_sqft=1200,
+        max_area_sqft=2000,
+        tenure="freehold",
+    )
+    PrivateResidentialRepository(accessor).nearby_growth(query, 30000.0, 33000.0)
+    sql, params = accessor.calls[0]
+
+    assert "$" not in sql
+    assert "AND t.tenure = 'Freehold'" in sql
+    assert "t.area_sqft >= {min_area_sqft:Float64}" in sql
+    assert "distance_m <= {radius_m:Float64}" in sql
+    assert params == {
+        "min_area_sqft": 1200,
+        "max_area_sqft": 2000,
+        "project": "TARGET",
+        "target_x": 30000.0,
+        "target_y": 33000.0,
+        "property_types": ["Apartment", "Condominium"],
+        "radius_m": 2000,
+        "max_peers": 50,
+        "months": 60,
+    }
+
+
+def test_nearby_growth_defaults_to_every_tenure_and_caps_peers():
+    accessor = FakeAccessor([])
+    query = GrowthQuery.from_inputs("TARGET", tenure="any")
+    PrivateResidentialRepository(accessor).nearby_growth(query, 1.0, 2.0)
+    sql, params = accessor.calls[0]
+    assert "AND tenure" not in sql
+    assert params["max_peers"] == 50 and "min_area_sqft" not in params
+    assert "LIMIT {max_peers:UInt32}" in sql
+
+
+def test_project_growth_is_parameterised_and_unprefixed():
+    accessor = FakeAccessor([project_growth_row()])
+    query = GrowthQuery.from_inputs("TARGET", min_area_sqft=1200, months=36)
+    row = PrivateResidentialRepository(accessor).project_growth(query)
+    sql, params = accessor.calls[0]
+    assert row["annual_growth"] == 0.039
+    assert "$" not in sql and "t.area_sqft" not in sql
+    assert "area_sqft >= {min_area_sqft:Float64}" in sql
+    assert params == {"min_area_sqft": 1200, "project": "TARGET", "months": 36}
+
+
+def test_growth_project_name_stays_in_parameters():
+    accessor = FakeAccessor([project_growth_row()])
+    query = GrowthQuery.from_inputs("x'; DROP TABLE t; --")
+    PrivateResidentialRepository(accessor).project_growth(query)
+    sql, params = accessor.calls[0]
+    assert "DROP" not in sql and params["project"] == "X'; DROP TABLE T; --"
+
+
+def test_affordable_projects_applies_filters_and_group_having():
+    accessor = FakeAccessor([])
+    query = AffordabilityQuery.from_inputs(
+        1_500_000, district=15, segment="landed", min_area_sqft=700, limit=20
+    )
+    PrivateResidentialRepository(accessor).affordable_projects(query)
+    sql, params = accessor.calls[0]
+
+    assert "$" not in sql and sql.count("WHERE") == 1
+    assert "district = {district:UInt8}" in sql
+    assert "price <= {max_price:Float64}" in sql
+    assert "property_type IN {property_types:Array(String)}" in sql
+    assert "area_sqft > 0" in sql
+    assert "HAVING transactions >= {min_transactions:UInt32}" in sql
+    assert params["max_price"] == 1_500_000
+    assert params["property_types"] == ["Terrace", "Semi-detached", "Detached"]
+    assert params["min_transactions"] == 3 and params["limit"] == 20

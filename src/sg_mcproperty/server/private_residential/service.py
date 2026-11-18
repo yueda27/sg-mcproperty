@@ -14,8 +14,14 @@ from typing import Any, TypedDict
 from . import regression
 from .filters import (
     AGE_GAP_NOTE_YEARS,
+    MAX_MORTGAGE_YEARS,
+    MAX_STRESS_RATE_PCT,
+    MIN_MORTGAGE_YEARS,
+    MIN_STRESS_RATE_PCT,
     PERIODS,
     SEGMENTS,
+    AffordabilityQuery,
+    GrowthQuery,
     NearbyQuery,
     PeerFilters,
     TransactionFilters,
@@ -53,6 +59,11 @@ COMPARABLE_AREA_BAND = 0.2
 # market_activity: periods compared (recent vs the same number before) and months per period
 ACTIVITY_WINDOW = {"month": 3, "quarter": 2, "year": 1}
 PERIOD_MONTHS = {"month": 1, "quarter": 3, "year": 12}
+
+# affordability_search: illustrative borrowing capacity, not a loan offer
+TDSR_PCT = 55.0  # share of gross monthly income a lender may count towards repayments
+MIN_DOWN_PAYMENT_PCT = 0.0
+MAX_DOWN_PAYMENT_PCT = 90.0
 
 
 class ProjectMatch(TypedDict):
@@ -327,6 +338,77 @@ class Coverage(TypedDict):
     last_month: str | None
 
 
+class GrowthStats(TypedDict):
+    project: str
+    street: str
+    district: int
+    tenure: str
+    lease_year: int | None
+    transactions: int
+    median_psf: float | None
+    median_price: float | None
+    annual_growth_pct: float | None
+
+
+class GrowthPeer(GrowthStats):
+    distance_m: int
+    better_than_target: bool
+
+
+class SizeBand(TypedDict):
+    min_area_sqft: float | None
+    max_area_sqft: float | None
+
+
+class NearbyGrowth(TypedDict):
+    project: str
+    segment: str
+    radius_m: int
+    window_start: str
+    window_end: str
+    size_band: SizeBand | None
+    tenure_filter: str
+    target: GrowthStats
+    peers: list[GrowthPeer]
+    projects_compared: int
+    insufficient_data: int
+    notes: list[str]
+
+
+class AffordableProject(TypedDict):
+    project: str
+    street: str
+    district: int
+    transactions: int
+    median_price: float | None
+    min_price: float | None
+    median_psf: float | None
+    min_area_sqft: float | None
+    max_area_sqft: float | None
+
+
+class MortgageAssumptions(TypedDict):
+    monthly_income: float
+    down_payment_pct: float
+    loan_tenure_years: int
+    stress_rate_pct: float
+    tdsr_pct: float
+
+
+class AffordabilityFilters(TypedDict):
+    district: int | None
+    segment: str
+    min_area_sqft: float | None
+
+
+class AffordabilityResult(TypedDict):
+    max_price: float
+    assumptions: MortgageAssumptions | None
+    filters: AffordabilityFilters
+    projects: list[AffordableProject]
+    notes: list[str]
+
+
 def _iso(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.date().isoformat()
@@ -375,6 +457,56 @@ def _remaining_lease(tenure: str, lease_year: int | None, year: int) -> float:
 def _pct(coefficient: float | None, scale: float = 1.0) -> float | None:
     """A log-price coefficient as a percentage effect: exp(b * scale) - 1."""
     return None if coefficient is None else round((math.exp(coefficient * scale) - 1) * 100, 1)
+
+
+def max_affordable_price(
+    monthly_income: float,
+    down_payment_pct: float,
+    loan_tenure_years: int,
+    stress_rate_pct: float,
+) -> float:
+    """Illustrative maximum purchase price from income, before duties and fees.
+
+    Counts `TDSR_PCT` of gross monthly income towards the repayment, prices the loan at the
+    stress rate (not a promotional rate), then grosses up for the down payment. It ignores
+    existing debts, stamp duty, legal fees and renovation, so it is a budgeting aid, not a
+    loan offer.
+    """
+    if monthly_income <= 0:
+        raise ValueError("monthly_income must be positive")
+    if not MIN_DOWN_PAYMENT_PCT <= down_payment_pct <= MAX_DOWN_PAYMENT_PCT:
+        raise ValueError(
+            f"down_payment_pct must be between {MIN_DOWN_PAYMENT_PCT:g} and "
+            f"{MAX_DOWN_PAYMENT_PCT:g}"
+        )
+    if not MIN_MORTGAGE_YEARS <= loan_tenure_years <= MAX_MORTGAGE_YEARS:
+        raise ValueError(
+            f"loan_tenure_years must be between {MIN_MORTGAGE_YEARS} and {MAX_MORTGAGE_YEARS}"
+        )
+    if not MIN_STRESS_RATE_PCT <= stress_rate_pct <= MAX_STRESS_RATE_PCT:
+        raise ValueError(
+            f"stress_rate_pct must be between {MIN_STRESS_RATE_PCT:g} and {MAX_STRESS_RATE_PCT:g}"
+        )
+    monthly_rate = stress_rate_pct / 100 / 12
+    months = loan_tenure_years * 12
+    payment = monthly_income * TDSR_PCT / 100
+    loan = payment * (1 - (1 + monthly_rate) ** -months) / monthly_rate
+    return round(loan / (1 - down_payment_pct / 100), -3)
+
+
+def _growth_row(row: dict[str, Any]) -> GrowthStats:
+    growth = _num(row.get("annual_growth"))
+    return {
+        "project": row["project"],
+        "street": row["street"],
+        "district": row["district"],
+        "tenure": row["tenure"],
+        "lease_year": _num(row.get("lease_year")),
+        "transactions": row["transactions"] or 0,
+        "median_psf": _num(row.get("median_psf")),
+        "median_price": _num(row.get("median_price")),
+        "annual_growth_pct": None if growth is None else round(growth * 100, 1),
+    }
 
 
 def _sale_from_row(
@@ -866,6 +998,189 @@ class PrivateResidentialService:
         total = sum(counts.values())
         average = sum(levels[p] * counts[p] for p in levels) / total
         return _pct(-average)
+
+    def income_budget(
+        self,
+        monthly_income: float,
+        down_payment_pct: float,
+        loan_tenure_years: int,
+        stress_rate_pct: float,
+    ) -> tuple[float, MortgageAssumptions]:
+        """Work out a budget from income, returning it with the assumptions used."""
+        max_price = max_affordable_price(
+            monthly_income, down_payment_pct, loan_tenure_years, stress_rate_pct
+        )
+        assumptions: MortgageAssumptions = {
+            "monthly_income": monthly_income,
+            "down_payment_pct": down_payment_pct,
+            "loan_tenure_years": loan_tenure_years,
+            "stress_rate_pct": stress_rate_pct,
+            "tdsr_pct": TDSR_PCT,
+        }
+        return max_price, assumptions
+
+    def rank_nearby_growth(self, query: GrowthQuery) -> NearbyGrowth:
+        """Rank the nearest projects by their resale psf trend, not their current price."""
+        repo = self._repository
+        profile = self._require_profile(query.project)
+        x, y = _num(profile["x"]), _num(profile["y"])
+        if x is None or y is None:
+            raise ValueError(
+                f"{query.project} has no coordinates in the data, so it has no nearest "
+                "projects to rank; use compare_nearby, which falls back to the same street "
+                "or district."
+            )
+        window_end = repo.coverage()["last_month"].date()
+        rows = repo.nearby_growth(query, x, y)
+        target_row = repo.project_growth(query)
+        target_growth = _num(target_row["annual_growth"])
+        target: GrowthStats = {
+            "project": query.project,
+            "street": profile["street"],
+            "district": profile["district"],
+            "tenure": profile["tenure"],
+            "lease_year": _num(profile["lease_year"]),
+            "transactions": target_row["transactions"] or 0,
+            "median_psf": _num(target_row["median_psf"]),
+            "median_price": _num(target_row["median_price"]),
+            "annual_growth_pct": (None if target_growth is None else round(target_growth * 100, 1)),
+        }
+
+        peers: list[GrowthPeer] = []
+        for row in rows:
+            stats = _growth_row(row)
+            peers.append(
+                {
+                    **stats,
+                    "distance_m": int(row["distance_m"]),
+                    "better_than_target": (
+                        stats["annual_growth_pct"] is not None
+                        and target["annual_growth_pct"] is not None
+                        and stats["annual_growth_pct"] > target["annual_growth_pct"]
+                    ),
+                }
+            )
+        ranked = [
+            p
+            for p in peers
+            if p["transactions"] >= query.min_transactions and p["annual_growth_pct"] is not None
+        ]
+        ranked.sort(key=lambda p: p["annual_growth_pct"] or 0, reverse=True)
+        ranked_names = {p["project"] for p in ranked}
+        insufficient = [p for p in peers if p["project"] not in ranked_names]
+
+        size_band: SizeBand | None = None
+        if query.min_area_sqft is not None or query.max_area_sqft is not None:
+            size_band = {
+                "min_area_sqft": query.min_area_sqft,
+                "max_area_sqft": query.max_area_sqft,
+            }
+
+        notes = [
+            (
+                "Growth is the annualised psf trend of Resale and Sub Sale units, fitted by "
+                "regressing log psf on time over the window. It is a recorded-price trend, "
+                "not a forecast."
+            )
+        ]
+        if size_band is None:
+            notes.append(
+                "No size band: units of different sizes are mixed, so psf growth is noisier."
+            )
+        if query.tenure != "any":
+            notes.append(f"Only {query.tenure} projects are included.")
+        if not peers:
+            notes.append(
+                f"No project with coordinates within {query.radius_m} m matched these filters."
+            )
+        elif not ranked:
+            notes.append(
+                f"No peer has {query.min_transactions}+ resales in the band with a measurable "
+                "trend; widen the radius, the window or the size band."
+            )
+        elif len(ranked) < 5:
+            notes.append(
+                f"Only {len(ranked)} peer projects carry a measurable trend: rankings are thin."
+            )
+        if target["annual_growth_pct"] is None:
+            notes.append(
+                "The project itself has fewer than 3 resales in the band, so its own growth "
+                "cannot be measured; better_than_target is false for every peer."
+            )
+        if insufficient:
+            notes.append(
+                f"{len(insufficient)} of {len(peers)} peers have fewer than "
+                f"{query.min_transactions} resales in the band or no measurable trend; they "
+                "are listed after the ranked peers without a ranking."
+            )
+        notes.append("Projects without coordinates cannot be scanned and are left out.")
+
+        return {
+            "project": query.project,
+            "segment": query.segment,
+            "radius_m": query.radius_m,
+            "window_start": add_months(window_end, -(query.months - 1)).isoformat(),
+            "window_end": window_end.isoformat(),
+            "size_band": size_band,
+            "tenure_filter": query.tenure,
+            "target": target,
+            "peers": ranked + insufficient,
+            "projects_compared": len(ranked),
+            "insufficient_data": len(insufficient),
+            "notes": notes,
+        }
+
+    def affordability_search(
+        self, query: AffordabilityQuery, assumptions: MortgageAssumptions | None = None
+    ) -> AffordabilityResult:
+        """Projects with recent sales inside the budget, dearest median first."""
+        rows = self._repository.affordable_projects(query)
+        projects: list[AffordableProject] = [
+            {
+                "project": row["project"],
+                "street": row["street"],
+                "district": row["district"],
+                "transactions": row["transactions"],
+                "median_price": _num(row["median_price"]),
+                "min_price": _num(row["min_price"]),
+                "median_psf": _num(row["median_psf"]),
+                "min_area_sqft": _num(row["min_area_sqft"]),
+                "max_area_sqft": _num(row["max_area_sqft"]),
+            }
+            for row in rows
+        ]
+        notes = [
+            (
+                "Each project has at least "
+                f"{query.min_transactions} sales at or below the budget; projects are ranked by "
+                "median sale price, highest first, so the list starts at the top of the budget."
+            )
+        ]
+        if assumptions is not None:
+            notes.append(
+                "The budget is an illustrative borrowing capacity at "
+                f"{assumptions['stress_rate_pct']:g}% and a {assumptions['tdsr_pct']:g}% "
+                "total debt servicing ratio. It ignores existing debts, stamp duty, legal "
+                "fees and renovation; it is not a loan offer."
+            )
+        if query.district is None:
+            notes.append("All districts are included; set district to narrow the search.")
+        if not projects:
+            notes.append(
+                "No project has enough sales within the budget; raise max_price, lower "
+                "min_transactions, or widen the district or area filter."
+            )
+        return {
+            "max_price": round(query.max_price),
+            "assumptions": assumptions,
+            "filters": {
+                "district": query.district,
+                "segment": query.segment,
+                "min_area_sqft": query.min_area_sqft,
+            },
+            "projects": projects,
+            "notes": notes,
+        }
 
     def market_activity(self, filters: TransactionFilters, period: str = "month") -> MarketActivity:
         key = validate_period(period)

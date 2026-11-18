@@ -57,6 +57,8 @@ def test_tools_prompts_and_resources_are_registered():
         "search_transactions",
         "price_trend",
         "compare_nearby",
+        "rank_nearby_growth",
+        "affordability_search",
         "dataset_info",
         "project_summary",
         "market_activity",
@@ -67,6 +69,19 @@ def test_tools_prompts_and_resources_are_registered():
         "property://private-residential/schema",
         "property://private-residential/coverage",
     }
+
+
+def test_elicitation_tools_publish_only_their_result_schema():
+    server = build_server(PrivateResidentialService(StubRepository()))
+
+    async def inspect():
+        async with Client(server) as client:
+            return {tool.name: tool.output_schema for tool in await client.list_tools()}
+
+    schemas = _run(inspect())
+    for name in ("estimate_value", "compare_nearby", "rank_nearby_growth", "affordability_search"):
+        properties = schemas[name].get("properties", {})
+        assert "result_type" not in properties and "input_requests" not in properties
 
 
 def test_tool_prompt_and_resource_end_to_end_with_stub():

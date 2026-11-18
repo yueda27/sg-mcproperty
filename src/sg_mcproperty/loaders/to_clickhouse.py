@@ -12,7 +12,7 @@ from loguru import logger
 
 from sg_mcproperty.config import Settings
 from sg_mcproperty.db import get_client
-from sg_mcproperty.loaders import private_residential
+from sg_mcproperty.loaders import private_rental, private_residential
 from sg_mcproperty.loaders.utils import OUTPUT_DIR
 
 CHUNK_ROWS = 100_000
@@ -22,7 +22,12 @@ DATASETS = {
         "file": "private_residential.parquet",
         "table": "private_residential_transactions",
         "columns": private_residential.COLUMNS,
-    }
+    },
+    "private-rental": {
+        "file": "private_rental.parquet",
+        "table": "private_residential_rentals",
+        "columns": private_rental.COLUMNS,
+    },
 }
 
 

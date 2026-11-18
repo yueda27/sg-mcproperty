@@ -5,11 +5,14 @@ import pytest
 
 from sg_mcproperty.accessor import ClickHouseAccessor
 from sg_mcproperty.server.private_residential import (
+    AffordabilityQuery,
+    GrowthQuery,
     NearbyQuery,
     PrivateResidentialRepository,
     PrivateResidentialService,
     TransactionFilters,
     ValuationQuery,
+    max_affordable_price,
 )
 from sg_mcproperty.server.private_residential.service import (
     MAX_PROJECT_RESULTS,
@@ -20,9 +23,12 @@ from .helpers import (
     FakeAnalysisRepository,
     FakeRepository,
     activity_row,
+    affordable_row,
     facets_row,
+    growth_row,
     peer_row,
     profile_row,
+    project_growth_row,
     project_row,
     stats_row,
     summary_row,
@@ -555,6 +561,122 @@ def test_estimate_value_unknown_project():
         )
 
 
+# --- growth scan --------------------------------------------------------------------------------
+
+
+def _growth(repo, **kwargs):
+    return PrivateResidentialService(repo).rank_nearby_growth(
+        GrowthQuery.from_inputs("target", **kwargs)
+    )
+
+
+def test_growth_scan_ranks_peers_and_marks_outperformers():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        growth_target=project_growth_row(growth=0.039),
+        growth_peers=[
+            growth_row("STEADY", distance_m=300, growth=0.020, transactions=10),
+            growth_row("FAST", distance_m=900, growth=0.060, transactions=6),
+            growth_row("THIN", distance_m=500, growth=0.090, transactions=2),
+            growth_row("UNKNOWN", distance_m=700, growth=None, transactions=20),
+        ],
+    )
+    out = _growth(repo, min_transactions=4, min_area_sqft=1200, max_area_sqft=2000)
+
+    assert [p["project"] for p in out["peers"]] == ["FAST", "STEADY", "THIN", "UNKNOWN"]
+    assert [p["better_than_target"] for p in out["peers"]] == [True, False, True, False]
+    assert out["target"]["annual_growth_pct"] == 3.9
+    assert out["size_band"] == {"min_area_sqft": 1200, "max_area_sqft": 2000}
+    assert out["projects_compared"] == 2 and out["insufficient_data"] == 2
+    assert (out["window_start"], out["window_end"]) == ("2021-12-01", "2026-11-01")
+    assert any("2 of 4 peers" in note for note in out["notes"])
+
+
+def test_growth_scan_without_coordinates_points_to_compare_nearby():
+    repo = FakeAnalysisRepository(profile=profile_row(x=None, y=None))
+    with pytest.raises(ValueError, match="compare_nearby"):
+        _growth(repo)
+
+
+def test_growth_scan_with_no_ranked_peers_explains_why():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        growth_peers=[growth_row("THIN", growth=None, transactions=1)],
+    )
+    out = _growth(repo)
+    assert out["projects_compared"] == 0
+    assert any("widen the radius" in note for note in out["notes"])
+    assert any("No size band" in note for note in out["notes"])
+
+
+def test_growth_scan_unknown_project():
+    with pytest.raises(ValueError, match="search_projects"):
+        _growth(FakeAnalysisRepository(profile=None))
+
+
+# --- affordability ------------------------------------------------------------------------------
+
+
+def test_max_affordable_price_uses_tdsr_and_stress_rate():
+    price = max_affordable_price(20_000, 25, 25, 4)
+    # 55% of 20k = 11k/month; 4% over 25 years discounts to about 2.08m; /0.75
+    assert 2_700_000 < price < 2_900_000
+    assert price % 1000 == 0
+    with pytest.raises(ValueError):
+        max_affordable_price(0, 25, 25, 4)
+    with pytest.raises(ValueError):
+        max_affordable_price(10_000, 100, 25, 4)
+    with pytest.raises(ValueError):
+        max_affordable_price(10_000, 25, 45, 4)
+    with pytest.raises(ValueError):
+        max_affordable_price(10_000, 25, 25, 0)
+
+
+def test_income_budget_returns_the_budget_with_its_assumptions():
+    price, assumptions = PrivateResidentialService(FakeAnalysisRepository()).income_budget(
+        20_000, 25, 25, 4
+    )
+    assert price == max_affordable_price(20_000, 25, 25, 4)
+    assert assumptions == {
+        "monthly_income": 20_000,
+        "down_payment_pct": 25,
+        "loan_tenure_years": 25,
+        "stress_rate_pct": 4,
+        "tdsr_pct": 55.0,
+    }
+
+
+def test_affordability_search_shapes_projects_and_assumptions():
+    repo = FakeAnalysisRepository(affordable=[affordable_row(), affordable_row("CHEAPER")])
+    assumptions = {
+        "monthly_income": 20_000.0,
+        "down_payment_pct": 25.0,
+        "loan_tenure_years": 25,
+        "stress_rate_pct": 4.0,
+        "tdsr_pct": 55.0,
+    }
+    query = AffordabilityQuery.from_inputs(1_500_000, district=15, min_area_sqft=700)
+    out = PrivateResidentialService(repo).affordability_search(query, assumptions)
+
+    assert out["max_price"] == 1_500_000
+    assert out["assumptions"] == assumptions
+    assert out["filters"] == {"district": 15, "segment": "non-landed", "min_area_sqft": 700}
+    assert [p["project"] for p in out["projects"]] == ["AFFORDABLE", "CHEAPER"]
+    assert out["projects"][0]["median_price"] == 1_500_000
+    assert any("55% " in note or "55%" in note for note in out["notes"])
+    assert repo.calls[0][0] == "affordable_projects"
+
+
+def test_affordability_search_empty_explains_how_to_widen():
+    repo = FakeAnalysisRepository(affordable=[])
+    out = PrivateResidentialService(repo).affordability_search(
+        AffordabilityQuery.from_inputs(800_000)
+    )
+    assert out["projects"] == [] and out["assumptions"] is None
+    assert any("raise max_price" in note for note in out["notes"])
+    assert any("All districts" in note for note in out["notes"])
+
+
 # --- live ClickHouse (skipped when unavailable) -------------------------------------------------
 
 
@@ -680,3 +802,32 @@ def test_live_estimate_value_for_a_project_without_coordinates(live_service):
     assert out["basis"] in ("street", "district")
     if out["estimate"] is not None:
         assert out["estimate"]["psf"] > 0 and out["unit"]["type_of_sale"] == "New Sale"
+
+
+def test_live_growth_scan_ranks_neighbours(live_service):
+    out = live_service.rank_nearby_growth(
+        GrowthQuery.from_inputs(
+            "duchess residences",
+            radius_m=2000,
+            months=60,
+            min_area_sqft=1200,
+            max_area_sqft=2000,
+            tenure="freehold or 999 years",
+        )
+    )
+    assert out["target"]["project"] == "DUCHESS RESIDENCES"
+    assert out["target"]["annual_growth_pct"] is not None
+    assert out["peers"] and out["projects_compared"] > 0
+    ranked = [p for p in out["peers"] if p["annual_growth_pct"] is not None]
+    assert ranked == sorted(ranked, key=lambda p: p["annual_growth_pct"], reverse=True)
+    assert all(p["distance_m"] <= 2000 for p in out["peers"])
+
+
+def test_live_affordability_search_finds_sales_inside_the_budget(live_service):
+    query = AffordabilityQuery.from_inputs(1_500_000, district=15, min_area_sqft=600, limit=10)
+    out = live_service.affordability_search(query)
+    assert out["projects"] and out["assumptions"] is None
+    assert all(p["min_price"] <= 1_500_000 for p in out["projects"])
+    prices = [p["median_price"] for p in out["projects"]]
+    assert prices == sorted(prices, reverse=True)
+    assert all(p["min_area_sqft"] >= 600 for p in out["projects"])

@@ -33,6 +33,17 @@ MAX_UNIT_AREA_SQFT = 20000
 MAX_FLOOR = 100
 AGE_GAP_NOTE_YEARS = 15  # peers whose lease start differs this much are flagged as a different age
 
+# Growth scan: resales a project needs before its trend is ranked
+MAX_GROWTH_TRANSACTIONS = 50
+GROWTH_TENURES = ("any", "freehold", "999 years", "freehold or 999 years")
+
+# Affordability search: caps and the mortgage assumptions offered to the user
+MAX_AFFORDABLE_RESULTS = 50
+MIN_MORTGAGE_YEARS = 5
+MAX_MORTGAGE_YEARS = 35
+MIN_STRESS_RATE_PCT = 0.1
+MAX_STRESS_RATE_PCT = 10.0
+
 
 def _squash(text: str) -> str:
     """Upper-case and collapse whitespace, the form project names are stored in."""
@@ -367,3 +378,104 @@ class ValuationQuery:
             if sale is None:
                 raise ValueError(f"type_of_sale must be one of {sorted(TYPES_OF_SALE.values())}")
         return cls(_squash(project), area_sqft, floor, sale, radius_m, months, max_peers)
+
+
+@dataclass(frozen=True)
+class GrowthQuery:
+    """Validated inputs for ranking nearby projects by their psf growth."""
+
+    project: str
+    radius_m: int = 2000
+    months: int = 60
+    max_peers: int = 50
+    min_transactions: int = 4
+    min_area_sqft: float | None = None
+    max_area_sqft: float | None = None
+    segment: str = "non-landed"
+    tenure: str = "any"
+
+    @classmethod
+    def from_inputs(
+        cls,
+        project: str,
+        radius_m: int = 2000,
+        months: int = 60,
+        max_peers: int = 50,
+        min_transactions: int = 4,
+        min_area_sqft: float | None = None,
+        max_area_sqft: float | None = None,
+        segment: str = "non-landed",
+        tenure: str = "any",
+    ) -> "GrowthQuery":
+        if not _squash(project):
+            raise ValueError("project is required")
+        if not MIN_RADIUS_M <= radius_m <= MAX_RADIUS_M:
+            raise ValueError(f"radius_m must be between {MIN_RADIUS_M} and {MAX_RADIUS_M}")
+        if not 1 <= months <= MAX_MONTHS:
+            raise ValueError(f"months must be between 1 and {MAX_MONTHS}")
+        if not 1 <= max_peers <= MAX_PEERS:
+            raise ValueError(f"max_peers must be between 1 and {MAX_PEERS}")
+        if not 1 <= min_transactions <= MAX_GROWTH_TRANSACTIONS:
+            raise ValueError(f"min_transactions must be between 1 and {MAX_GROWTH_TRANSACTIONS}")
+        if min_area_sqft is not None and min_area_sqft <= 0:
+            raise ValueError("min_area_sqft must be positive")
+        if max_area_sqft is not None and max_area_sqft <= 0:
+            raise ValueError("max_area_sqft must be positive")
+        _check_range(min_area_sqft, max_area_sqft, "area_sqft")
+        segment_name = resolve_segment(segment, None)
+        if segment_name is None:
+            raise ValueError("segment must be one of non-landed, ec, landed or strata-landed")
+        tenure_key = _squash(tenure).lower()
+        if tenure_key not in GROWTH_TENURES:
+            raise ValueError(f"tenure must be one of {list(GROWTH_TENURES)}")
+        return cls(
+            _squash(project),
+            radius_m,
+            months,
+            max_peers,
+            min_transactions,
+            min_area_sqft,
+            max_area_sqft,
+            segment_name,
+            tenure_key,
+        )
+
+
+@dataclass(frozen=True)
+class AffordabilityQuery:
+    """Validated inputs for finding projects whose sales fit a budget."""
+
+    max_price: float
+    district: int | None = None
+    segment: str = "non-landed"
+    min_area_sqft: float | None = None
+    min_transactions: int = 3
+    limit: int = 20
+
+    @classmethod
+    def from_inputs(
+        cls,
+        max_price: float,
+        district: int | None = None,
+        segment: str = "non-landed",
+        min_area_sqft: float | None = None,
+        min_transactions: int = 3,
+        limit: int = 20,
+    ) -> "AffordabilityQuery":
+        if not 0 < max_price <= 100_000_000:
+            raise ValueError("max_price must be between 0 and 100,000,000 SGD")
+        if min_area_sqft is not None and min_area_sqft <= 0:
+            raise ValueError("min_area_sqft must be positive")
+        if not 1 <= min_transactions <= MAX_GROWTH_TRANSACTIONS:
+            raise ValueError(f"min_transactions must be between 1 and {MAX_GROWTH_TRANSACTIONS}")
+        segment_name = resolve_segment(segment, None)
+        if segment_name is None:
+            raise ValueError("segment must be one of non-landed, ec, landed or strata-landed")
+        return cls(
+            max_price,
+            validate_district(district),
+            segment_name,
+            min_area_sqft,
+            min_transactions,
+            max(1, min(limit, MAX_AFFORDABLE_RESULTS)),
+        )

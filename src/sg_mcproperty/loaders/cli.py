@@ -4,13 +4,17 @@ import argparse
 
 from sg_mcproperty.loaders.utils import dump_file
 
-from . import private_residential
+from . import private_rental, private_residential
 
 LOADERS = {
     "private-residential": {
         "function": private_residential.load,
         "filename": "private_residential.parquet",
-    }
+    },
+    "private-rental": {
+        "function": private_rental.load,
+        "filename": "private_rental.parquet",
+    },
 }
 
 

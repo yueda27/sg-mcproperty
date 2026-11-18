@@ -3,11 +3,14 @@ from datetime import date
 import pytest
 
 from sg_mcproperty.server.private_residential import (
+    AffordabilityQuery,
+    GrowthQuery,
     NearbyQuery,
     TransactionFilters,
     ValuationQuery,
 )
 from sg_mcproperty.server.private_residential.filters import (
+    MAX_AFFORDABLE_RESULTS,
     PeerFilters,
     add_months,
     normalise_project_name,
@@ -225,3 +228,70 @@ def test_valuation_query_normalises_and_defaults():
 def test_valuation_query_rejects_bad_inputs(kwargs):
     with pytest.raises(ValueError):
         ValuationQuery.from_inputs(**{"project": "AUREA", "area_sqft": 900, **kwargs})
+
+
+# --- growth scan and affordability ---------------------------------------------------------------
+
+
+def test_growth_query_normalises_and_defaults():
+    query = GrowthQuery.from_inputs(
+        " treasure  at tampines ",
+        min_area_sqft=1200,
+        max_area_sqft=2000,
+        tenure="Freehold or 999 years",
+    )
+    assert query.project == "TREASURE AT TAMPINES"
+    assert (query.radius_m, query.months, query.max_peers, query.min_transactions) == (
+        2000,
+        60,
+        50,
+        4,
+    )
+    assert (query.min_area_sqft, query.max_area_sqft) == (1200, 2000)
+    assert (query.segment, query.tenure) == ("non-landed", "freehold or 999 years")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"project": " "},
+        {"radius_m": 50},
+        {"radius_m": 3001},
+        {"months": 0},
+        {"months": 61},
+        {"max_peers": 0},
+        {"max_peers": 51},
+        {"min_transactions": 0},
+        {"min_transactions": 51},
+        {"min_area_sqft": 0},
+        {"max_area_sqft": -1},
+        {"min_area_sqft": 2000, "max_area_sqft": 1200},
+        {"segment": "hotel"},
+        {"tenure": "leasehold"},
+    ],
+)
+def test_growth_query_rejects_bad_inputs(kwargs):
+    with pytest.raises(ValueError):
+        GrowthQuery.from_inputs(**{"project": "AUREA", **kwargs})
+
+
+def test_affordability_query_clamps_and_validates():
+    query = AffordabilityQuery.from_inputs(1_500_000, district=15, limit=500)
+    assert (query.max_price, query.district, query.segment, query.limit) == (
+        1_500_000,
+        15,
+        "non-landed",
+        MAX_AFFORDABLE_RESULTS,
+    )
+
+    for kwargs in (
+        {"max_price": 0},
+        {"max_price": -1},
+        {"max_price": 100_000_001},
+        {"min_area_sqft": 0},
+        {"min_transactions": 0},
+        {"segment": "hotel"},
+        {"district": 29},
+    ):
+        with pytest.raises(ValueError):
+            AffordabilityQuery.from_inputs(**{"max_price": 1_000_000, **kwargs})

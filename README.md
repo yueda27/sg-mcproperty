@@ -9,10 +9,10 @@ URA API --(sg-property-load --dump)--> output/*.parquet --(to_clickhouse)--> Cli
 ```
 
 Status: private residential transactions are fetched, transformed, dumped to parquet and
-loaded into ClickHouse. The MCP server has eight tools (`search_projects`, `search_transactions`,
-`price_trend`, `compare_nearby`, `dataset_info`, `project_summary`, `market_activity`,
-`estimate_value`), three prompts and two resources for that dataset. More tools are
-planned (see [TODO](#todo)).
+loaded into ClickHouse. The MCP server has ten tools (`search_projects`, `search_transactions`,
+`price_trend`, `compare_nearby`, `rank_nearby_growth`, `affordability_search`, `dataset_info`,
+`project_summary`, `market_activity`, `estimate_value`), three prompts and two resources for
+that dataset. More tools are planned (see [TODO](#todo)).
 
 ## 1. Prerequisites
 
@@ -67,6 +67,15 @@ uv run sg-property-migrate        # creates the database and applies pending mig
   numbered file instead. The current schema is still `0001` because nothing was released.
 - One statement per `;`, and no `;` inside comments or strings.
 
+### The rentals table
+
+`0003_private_residential_rentals.sql` creates `sg_property.private_residential_rentals`: `project`,
+`street`, `district` (UInt8), `property_type`, `lease_date` (DateTime, first of the month),
+`area_sqft_min` and `area_sqft_max` (Nullable UInt32), `bedrooms` (Nullable UInt8), `rent` (Float64,
+monthly SGD), `x` and `y` (Nullable Float64, SVY21 metres) and `loaded_at`. Like the sales table it
+is a plain `MergeTree` ordered by `(district, project, lease_date)` and partitioned by year, and the
+loader truncates it before each insert. No MCP tool reads it yet.
+
 ### The table
 
 `0001_private_residential_transactions.sql` creates `sg_property.private_residential_transactions`, and
@@ -112,10 +121,34 @@ This runs `loaders/cli.py`:
 
 Expect about 131,000 rows covering the last 5 years (URA's rolling window).
 
+### Rental contracts
+
+```bash
+uv run sg-property-load private-rental --dump
+```
+
+Same pipeline for URA's rental contracts (`PMI_Resi_Rental`, which serves one quarter at a time):
+
+1. `URAClient.rental_contracts_many` fetches the latest 21 quarters (`refPeriod` such as `25q3`,
+   newest first, 6 requests at a time). 21 quarters is URA's whole history (21q4 was the oldest
+   with data in November 2026) and a quarter URA has not published yet just comes back empty.
+2. `loaders/private_rental.py` flattens projects and their `rental` lists into one row per
+   contract and converts types: `lease_date` from `mmyy`, the area band to `area_sqft_min` and
+   `area_sqft_max` (`1700-1800`, or `>3000` and `<=500` with one side null), `bedrooms` (null when
+   URA says `NA` or omits it), `rent` (monthly SGD) and the project's `x` and `y`.
+3. `--dump` writes `output/private_rental.parquet` (about 450,000 rows, 3 MB, in about 10 seconds).
+
+Rental property types are URA's rental wording (`Non-landed Properties`, `Terrace House`,
+`Semi-Detached House`, `Detached House`, `Executive Condominium`), which differs from the sales
+feed, so they are stored as given. About 13% of contracts have no bedroom count. Identical
+contracts within a quarter are real separate rows (bands are coarse and there is no contract id),
+so nothing is deduplicated.
+
 ## 6. Load into ClickHouse
 
 ```bash
 uv run python -m sg_mcproperty.loaders.to_clickhouse private-residential
+uv run python -m sg_mcproperty.loaders.to_clickhouse private-rental
 ```
 
 `loaders/to_clickhouse.py` reads the parquet file, checks the columns match, **truncates the
@@ -148,8 +181,10 @@ What it exposes for private residential data:
 | Tool | `search_transactions` | List transactions, newest first, filtered by project, district, segment, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
 | Tool | `price_trend` | Median price and psf per month, quarter or year, for a project, district or the market. Flags thin periods and reports the psf change |
 | Tool | `compare_nearby` | Compares one project's psf with similar projects nearby to value it (see below) |
-| Prompt | `project_overview` | Guides the model through summarising one project's recent sales |
-| Prompt | `recent_deals` | Guides the model through listing notable sales in a district |
+| Tool | `rank_nearby_growth` | Ranks the nearest projects by annualised psf growth, using resales in the same window and size band. Finds neighbours that grew faster than the project |
+| Tool | `affordability_search` | Projects with sales inside a budget, dearest median price first. Asks for a budget or works one out from income and loan assumptions (see below) |
+| Prompt | `project_overview` | Guides the model through summarising one project's recent sales, liquidity and price trend |
+| Prompt | `recent_deals` | Guides the model through ranking notable sales in a district, respecting the row cap |
 | Prompt | `value_project` | Guides the model through a full assessment: liquidity, comparison with nearby projects, a unit estimate and the price trend |
 | Resource | `property://private-residential/schema` | Column meanings, units and caveats |
 | Resource | `property://private-residential/coverage` | Live row count, project count and date range |
@@ -209,6 +244,45 @@ trend), a sanity check against the project's own median psf, and notes.
 - It is plain Python on a few hundred rows (`server/private_residential/regression.py`), with no
   numpy dependency.
 
+### Ranking neighbours by growth (`rank_nearby_growth`)
+
+```bash
+python -m sg_mcproperty.server.dev_client call rank_nearby_growth "project=duchess residences" radius_m=2000 min_area_sqft=1200 max_area_sqft=2000 "tenure=freehold or 999 years"
+```
+
+- Scans the nearest `max_peers` projects (default 50, within `radius_m`, default 2000), fits each
+  project's annualised psf trend over `months` (default 60, the full dataset), then ranks the
+  projects whose trend is measurable.
+- Only **Resale and Sub Sale** units are used, so launch prices do not distort the trend. The same
+  size band, window and tenure filter (`any`, `freehold`, `999 years`, `freehold or 999 years`)
+  apply to the project and its peers.
+- `annual_growth_pct` is a recorded-price trend, not a forecast: 4.5 means +4.5% a year. Projects
+  with fewer than `min_transactions` resales (default 4) or fewer than 3 usable sales are returned
+  after the ranked peers with no growth figure, so the coverage is visible.
+- Projects without coordinates cannot be scanned; use `compare_nearby` for those.
+
+### Searching by budget (`affordability_search`)
+
+```bash
+python -m sg_mcproperty.server.dev_client call affordability_search max_price=1500000 district=15 min_area_sqft=700
+```
+
+- Returns projects with at least `min_transactions` sales (default 3) at or below the budget,
+  dearest median price first, with their median and minimum price, median psf and area range.
+- Omit `max_price` and the tool asks for a budget, or for a gross monthly income plus down payment,
+  loan tenure and stress rate, and works one out. The calculation is illustrative: it counts 55% of
+  gross monthly income (TDSR) at the stress rate, then grosses up for the down payment. It ignores
+  existing debts, stamp duty, legal fees and renovation, so it is not a loan offer.
+
+### Elicitation
+
+`estimate_value` (no size), `compare_nearby` (`ask_basis=true`), `rank_nearby_growth`
+(`ask_scope=true`) and `affordability_search` (no budget) ask for missing input mid-call. The
+helper in `server/elicitation.py` supports both protocol eras: handshake connections use
+`ctx.elicit`, while the 2026-07-28 protocol returns an `InputRequiredResult` and the client retries
+the call with the answers. Declining a form falls back to the arguments already passed, except for
+`estimate_value` and `affordability_search`, where there is nothing to answer without it.
+
 ### Trying the tools without an MCP client
 
 ```bash
@@ -243,7 +317,8 @@ together. SQL values always go through `{name:Type}` parameters, never string fo
 `.vscode/launch.json` is gitignored, so it is local. It has five configurations, all using the
 `.venv` interpreter and loading `.env`:
 
-- **Load: private-residential**: `sg_mcproperty.loaders.cli private-residential --dump`
+- **Load: private-residential** and **Load: private-rental**: `sg_mcproperty.loaders.cli <dataset> --dump`
+- **Load output -> ClickHouse: private-rental**: `sg_mcproperty.loaders.to_clickhouse private-rental`
 - **Load output -> ClickHouse: private-residential**: `sg_mcproperty.loaders.to_clickhouse`
 - **Migrate: ClickHouse**: `sg_mcproperty.migrate`
 - **MCP dev client: list tools** and **MCP dev client: call tool**: `sg_mcproperty.server.dev_client`
@@ -275,7 +350,8 @@ loader does not exist in this repo.
 | `clickhouse/migrations/` | Versioned DDL |
 | `src/sg_mcproperty/migrate.py` | Migration runner (`sg-property-migrate`) |
 | `src/sg_mcproperty/loaders/client.py` | URA API client |
-| `src/sg_mcproperty/loaders/private_residential.py` | `flatten` and `transform` for URA transactions |
+| `src/sg_mcproperty/loaders/private_residential.py` | `flatten` and `transform` for URA sales transactions |
+| `src/sg_mcproperty/loaders/private_rental.py` | `flatten` and `transform` for URA rental contracts |
 | `src/sg_mcproperty/loaders/cli.py` | `sg-property-load` (fetch, transform, dump) |
 | `src/sg_mcproperty/loaders/to_clickhouse.py` | Parquet to ClickHouse |
 | `src/sg_mcproperty/loaders/utils.py` | `output/` path and `dump_file` |
@@ -294,10 +370,14 @@ loader does not exist in this repo.
 
 1. ~~Setup loading script~~ done for private residential. HDB resale loader still to do
 2. ~~Setup tables~~ done for private residential
-3. ~~Setup MCP tools~~ `search_projects`, `search_transactions`, `price_trend` and `compare_nearby`
-   `dataset_info`, `project_summary`, `market_activity` and `estimate_value` done. Still planned:
-   `rank_projects`, `affordability_search`
+3. ~~Setup MCP tools~~ `search_projects`, `search_transactions`, `price_trend`,
+   `compare_nearby`, `rank_nearby_growth`, `affordability_search`, `dataset_info`,
+   `project_summary`, `market_activity` and `estimate_value` done. Still planned:
+   `rank_projects`
 4. ~~Keep URA `propertyType` and the coordinates~~ done. `typeOfArea` and `marketSegment` are still
    dropped. Fill in coordinates for projects URA leaves blank (for example by geocoding the street)
-5. Add URA rental contracts (`noOfBedRoom`) to estimate bedrooms per transaction
+5. ~~Add URA rental contracts~~ table and loader done. Still to do: a rental yield tool and a way to
+   estimate bedrooms per sale from the rental bands (`bedrooms` by project and area band). The rental
+   coordinates do not help the sales gap: only 48 of the 150 sale projects with no coordinates are in
+   the rentals with coordinates, covering 84 of about 27,800 affected sales
 6. Optional `--load` flag on `sg-property-load` to dump and insert in one command

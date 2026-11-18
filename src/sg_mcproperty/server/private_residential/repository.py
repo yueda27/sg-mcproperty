@@ -14,7 +14,13 @@ from typing import Any
 
 from sg_mcproperty.accessor import Queryable
 
-from .filters import PeerFilters, TransactionFilters
+from .filters import (
+    SEGMENTS,
+    AffordabilityQuery,
+    GrowthQuery,
+    PeerFilters,
+    TransactionFilters,
+)
 
 TABLE = "private_residential_transactions"
 
@@ -311,12 +317,162 @@ VALUATION_SAMPLE_SQL = Template(
     """
 )
 
+# Tenure filters for the growth scan. Fixed fragments, chosen from a whitelist in filters.py.
+# The table alias `t` keeps an output alias such as `tenure` from shadowing the raw column.
+GROWTH_TENURE_SQL = {
+    "any": "",
+    "freehold": "AND t.tenure = 'Freehold'",
+    "999 years": "AND t.tenure = '999 years'",
+    "freehold or 999 years": "AND t.tenure IN ('Freehold', '999 years')",
+}
+
+# One project's psf growth: log psf regressed on time for its resales in the size band.
+# `$area_filter` holds fixed fragments with parameterised bounds.
+PROJECT_GROWTH_SQL = Template(
+    """
+    WITH bounds AS (SELECT max(contract_date) AS last_month FROM $table),
+    sales AS (
+        SELECT
+            price / area_sqft AS psf,
+            price,
+            dateDiff('day', contract_date, (SELECT last_month FROM bounds)) / 365.25
+                AS years_before_end
+        FROM $table
+        WHERE project = {project:String} AND area_sqft > 0 AND price > 0
+            AND type_of_sale IN ('Resale', 'Sub Sale')
+            AND contract_date >= addMonths(
+                (SELECT last_month FROM bounds), -({months:Int32} - 1)
+            )
+            $area_filter
+    )
+    SELECT
+        count() AS transactions,
+        round(quantileExactIf(0.5)(psf, psf > 0)) AS median_psf,
+        round(quantileExactIf(0.5)(price, psf > 0)) AS median_price,
+        if(count() > 2 AND varPop(-years_before_end) > 0,
+            exp(covarPop(ln(psf), -years_before_end) / varPop(-years_before_end)) - 1,
+            NULL) AS annual_growth
+    FROM sales
+    """
+)
+
+# The nearest projects (by SVY21 distance), each with its own psf growth over the same window
+# and size band. Growth is null when the project has fewer than 3 resales in the band.
+NEARBY_GROWTH_SQL = Template(
+    """
+    WITH bounds AS (SELECT max(contract_date) AS last_month FROM $table),
+    near AS (
+        SELECT
+            project,
+            any(street) AS street,
+            argMax(district, contract_date) AS district,
+            argMax(tenure, contract_date) AS tenure,
+            argMax(lease_year, contract_date) AS lease_year,
+            argMax(property_type, contract_date) AS property_type,
+            round(sqrt(
+                pow(avg(t.x) - {target_x:Float64}, 2) + pow(avg(t.y) - {target_y:Float64}, 2)
+            )) AS distance_m
+        FROM $table t
+        WHERE t.project != {project:String} AND t.x IS NOT NULL AND t.area_sqft > 0
+            AND t.property_type IN {property_types:Array(String)}
+            $tenure_filter
+        GROUP BY t.project
+        HAVING distance_m <= {radius_m:Float64}
+        ORDER BY distance_m ASC
+        LIMIT {max_peers:UInt32}
+    ),
+    sales AS (
+        SELECT
+            project,
+            count() AS transactions,
+            round(quantileExactIf(0.5)(psf, psf > 0)) AS median_psf,
+            round(quantileExactIf(0.5)(price, psf > 0)) AS median_price,
+            if(count() > 2 AND varPop(-years_before_end) > 0,
+                exp(covarPop(ln(psf), -years_before_end) / varPop(-years_before_end)) - 1,
+                NULL) AS annual_growth
+        FROM (
+            SELECT
+                t.project AS project,
+                t.price / t.area_sqft AS psf,
+                t.price AS price,
+                dateDiff('day', t.contract_date, (SELECT last_month FROM bounds)) / 365.25
+                    AS years_before_end
+            FROM $table t
+            INNER JOIN near n ON t.project = n.project
+            WHERE t.area_sqft > 0
+                AND t.price > 0
+                AND t.type_of_sale IN ('Resale', 'Sub Sale')
+                AND t.contract_date >= addMonths(
+                    (SELECT last_month FROM bounds), -({months:Int32} - 1)
+                )
+                $area_filter
+        )
+        GROUP BY project
+    )
+    SELECT
+        n.project,
+        n.street,
+        n.district,
+        n.tenure,
+        n.lease_year,
+        n.property_type,
+        n.distance_m,
+        if(s.project = '', 0, s.transactions) AS transactions,
+        if(s.project = '', NULL, s.median_psf) AS median_psf,
+        if(s.project = '', NULL, s.median_price) AS median_price,
+        if(s.project = '', NULL, s.annual_growth) AS annual_growth
+    FROM near n
+    LEFT JOIN sales s ON s.project = n.project
+    ORDER BY isNull(annual_growth) ASC, annual_growth DESC, n.distance_m ASC
+    """
+)
+
+# Projects with at least one sale inside the budget. `$where` comes from TransactionFilters.
+# Filter in a subquery so the output aliases (district, transactions, ...) cannot shadow the
+# columns the WHERE clause filters on.
+AFFORDABLE_PROJECTS_SQL = Template(
+    """
+    SELECT
+        project,
+        any(street) AS street,
+        any(district) AS district,
+        count() AS transactions,
+        round(quantileExact(0.5)(price)) AS median_price,
+        min(price) AS min_price,
+        round(quantileExactIf(0.5)(price / area_sqft, area_sqft > 0)) AS median_psf,
+        round(min(area_sqft), 1) AS min_area_sqft,
+        round(max(area_sqft), 1) AS max_area_sqft
+    FROM (
+        SELECT * FROM $table
+        $where
+    )
+    GROUP BY project
+    HAVING transactions >= {min_transactions:UInt32}
+    ORDER BY median_price DESC
+    LIMIT {limit:UInt32}
+    """
+)
+
 
 # --- Repository (data access) -------------------------------------------------------------------
 
 
 def _unprefix(row: dict[str, Any]) -> dict[str, Any]:
     return {k.removeprefix("peer_"): v for k, v in row.items()}
+
+
+def _area_filter(
+    min_area: float | None, max_area: float | None, prefix: str = ""
+) -> tuple[str, dict[str, Any]]:
+    """Fixed area fragments plus parameter values, for the growth queries."""
+    sql, params = "", {}
+    if min_area is not None:
+        sql += f"AND {prefix}area_sqft >= {{min_area_sqft:Float64}} "
+        params["min_area_sqft"] = min_area
+    if max_area is not None:
+        sql += f"AND {prefix}area_sqft <= {{max_area_sqft:Float64}} "
+        params["max_area_sqft"] = max_area
+    return sql, params
 
 
 class PrivateResidentialRepository:
@@ -454,6 +610,54 @@ class PrivateResidentialRepository:
         peer_sql, params = filters.to_sql()
         sql = VALUATION_SAMPLE_SQL.substitute(table=self._table, peer_filters=peer_sql)
         return self._accessor.query(sql, {**params, "projects": projects, "limit": limit})
+
+    def nearby_growth(self, query: GrowthQuery, x: float, y: float) -> list[dict[str, Any]]:
+        area_sql, area_params = _area_filter(query.min_area_sqft, query.max_area_sqft, prefix="t.")
+        sql = NEARBY_GROWTH_SQL.substitute(
+            table=self._table,
+            tenure_filter=GROWTH_TENURE_SQL[query.tenure],
+            area_filter=area_sql,
+        )
+        return self._accessor.query(
+            sql,
+            {
+                **area_params,
+                "project": query.project,
+                "target_x": x,
+                "target_y": y,
+                "property_types": list(SEGMENTS[query.segment]),
+                "radius_m": query.radius_m,
+                "max_peers": query.max_peers,
+                "months": query.months,
+            },
+        )
+
+    def project_growth(self, query: GrowthQuery) -> dict[str, Any]:
+        area_sql, area_params = _area_filter(query.min_area_sqft, query.max_area_sqft)
+        sql = PROJECT_GROWTH_SQL.substitute(table=self._table, area_filter=area_sql)
+        return self._accessor.query(
+            sql,
+            {**area_params, "project": query.project, "months": query.months},
+        )[0]
+
+    def affordable_projects(self, query: AffordabilityQuery) -> list[dict[str, Any]]:
+        filters = TransactionFilters.from_inputs(
+            district=query.district,
+            max_price=query.max_price,
+            min_area_sqft=query.min_area_sqft,
+            segment=query.segment,
+        )
+        where, params = filters.to_sql()
+        where = f"{where} AND area_sqft > 0" if where else "WHERE area_sqft > 0"
+        sql = AFFORDABLE_PROJECTS_SQL.substitute(table=self._table, where=where)
+        return self._accessor.query(
+            sql,
+            {
+                **params,
+                "min_transactions": query.min_transactions,
+                "limit": query.limit,
+            },
+        )
 
     @property
     def _table(self) -> str:

@@ -110,6 +110,23 @@ class URAClient:
         """Private residential rental contracts for a quarter, e.g. ``"24q1"``."""
         return self.fetch("PMI_Resi_Rental", refPeriod=ref_period)
 
+    def rental_contracts_many(
+        self, ref_periods: list[str], max_workers: int = 6
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Rental contracts for several quarters, fetched in parallel. Keys are the quarters.
+
+        Quarters URA has no data for (too old, or not yet published) come back as empty lists.
+        """
+        self.token  # authenticate once up front so threads do not race to get tokens
+
+        def fetch_quarter(ref_period: str) -> list[dict[str, Any]]:
+            logger.info(f"Fetching URA rental contracts {ref_period}")
+            return self.rental_contracts(ref_period)
+
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(ref_periods)) or 1) as pool:
+            results = list(pool.map(fetch_quarter, ref_periods))
+        return dict(zip(ref_periods, results))
+
     def rental_median(self) -> list[dict[str, Any]]:
         """Median private residential rentals by project."""
         return self.fetch("PMI_Resi_Rental_Median")

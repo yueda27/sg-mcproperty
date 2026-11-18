@@ -208,6 +208,48 @@ def activity_row(period, transactions=10, new=0, sub=0, resale=None, psf=2000.0)
     }
 
 
+def growth_row(project="PEER A", distance_m=500, growth=0.045, transactions=8, **overrides):
+    row = {
+        "project": project,
+        "street": "OTHER ROAD",
+        "district": 15,
+        "tenure": "99 years",
+        "lease_year": 2010,
+        "property_type": "Condominium",
+        "distance_m": distance_m,
+        "transactions": transactions,
+        "median_psf": 2000.0,
+        "median_price": 2_000_000.0,
+        "annual_growth": growth,
+    }
+    return {**row, **overrides}
+
+
+def project_growth_row(growth=0.039, transactions=12, **overrides):
+    row = {
+        "transactions": transactions,
+        "median_psf": 2100.0,
+        "median_price": 2_100_000.0,
+        "annual_growth": growth,
+    }
+    return {**row, **overrides}
+
+
+def affordable_row(project="AFFORDABLE", **overrides):
+    row = {
+        "project": project,
+        "street": "VALUE ROAD",
+        "district": 15,
+        "transactions": 5,
+        "median_price": 1_500_000.0,
+        "min_price": 1_200_000.0,
+        "median_psf": 1500.0,
+        "min_area_sqft": 700.0,
+        "max_area_sqft": 1100.0,
+    }
+    return {**row, **overrides}
+
+
 class FakeAnalysisRepository:
     """Repository stand-in for price_trend and compare_nearby. Records the calls made."""
 
@@ -225,6 +267,9 @@ class FakeAnalysisRepository:
         summary=None,
         sample=(),
         activity=(),
+        growth_peers=(),
+        growth_target=None,
+        affordable=(),
     ):
         self.trend = list(trend)
         self.profile = profile
@@ -238,6 +283,9 @@ class FakeAnalysisRepository:
         self.summary = summary or summary_row()
         self.sample = list(sample)
         self.activity = list(activity)
+        self.growth_peers = list(growth_peers)
+        self.growth_target = growth_target or project_growth_row()
+        self.affordable = list(affordable)
         self.calls = []
 
     def price_trend(self, filters, period_fn):
@@ -289,3 +337,15 @@ class FakeAnalysisRepository:
     def market_activity(self, filters, period_fn):
         self.calls.append(("market_activity", filters, period_fn))
         return self.activity
+
+    def nearby_growth(self, query, x, y):
+        self.calls.append(("nearby_growth", query, x, y))
+        return self.growth_peers
+
+    def project_growth(self, query):
+        self.calls.append(("project_growth", query))
+        return self.growth_target
+
+    def affordable_projects(self, query):
+        self.calls.append(("affordable_projects", query))
+        return self.affordable
