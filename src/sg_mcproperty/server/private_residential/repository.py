@@ -120,6 +120,15 @@ COVERAGE_SQL = Template(
     """
 )
 
+# How much of the sales dataset the rental contracts can enrich. `$rental_table` is a trusted
+# identifier supplied by the rental repository, never user input.
+RENTAL_OVERLAP_SQL = Template(
+    """
+    SELECT uniqExactIf(project, project IN (SELECT project FROM $rental_table)) AS with_rentals
+    FROM $table
+    """
+)
+
 # Median price and psf per period. `$period_fn` is one of the whitelisted functions in
 # `filters.PERIODS`. `$where` always includes `area_sqft > 0` so psf is defined.
 PRICE_TREND_SQL = Template(
@@ -317,6 +326,25 @@ VALUATION_SAMPLE_SQL = Template(
     """
 )
 
+# Resale psf per project in a size band: the denominator of a gross rental yield. New sales are
+# excluded because developer pricing would depress the yield of a new launch.
+PROJECT_SALE_PSF_SQL = Template(
+    """
+    SELECT
+        project,
+        count() AS sales,
+        round(quantileExact(0.5)(price / area_sqft)) AS median_psf
+    FROM $table
+    WHERE project IN {projects:Array(String)}
+        AND area_sqft >= {area_low:Float64}
+        AND area_sqft <= {area_high:Float64}
+        AND price > 0
+        AND type_of_sale IN ('Resale', 'Sub Sale')
+        AND contract_date >= {start_date:Date}
+    GROUP BY project
+    """
+)
+
 # Tenure filters for the growth scan. Fixed fragments, chosen from a whitelist in filters.py.
 # The table alias `t` keeps an output alias such as `tenure` from shadowing the raw column.
 GROWTH_TENURE_SQL = {
@@ -335,6 +363,7 @@ PROJECT_GROWTH_SQL = Template(
         SELECT
             price / area_sqft AS psf,
             price,
+            area_sqft,
             dateDiff('day', contract_date, (SELECT last_month FROM bounds)) / 365.25
                 AS years_before_end
         FROM $table
@@ -349,6 +378,7 @@ PROJECT_GROWTH_SQL = Template(
         count() AS transactions,
         round(quantileExactIf(0.5)(psf, psf > 0)) AS median_psf,
         round(quantileExactIf(0.5)(price, psf > 0)) AS median_price,
+        round(quantileExactIf(0.5)(area_sqft, psf > 0)) AS median_area_sqft,
         if(count() > 2 AND varPop(-years_before_end) > 0,
             exp(covarPop(ln(psf), -years_before_end) / varPop(-years_before_end)) - 1,
             NULL) AS annual_growth
@@ -504,6 +534,15 @@ class PrivateResidentialRepository:
     def coverage(self) -> dict[str, Any]:
         return self._accessor.query(COVERAGE_SQL.substitute(table=self._table))[0]
 
+    def rental_project_overlap(self, rental_table: str) -> dict[str, Any]:
+        """Count sale projects that also have rental contracts.
+
+        `rental_table` must be an already-resolved, trusted identifier from the rental
+        repository, never user input.
+        """
+        sql = RENTAL_OVERLAP_SQL.substitute(table=self._table, rental_table=rental_table)
+        return self._accessor.query(sql)[0]
+
     def price_trend(self, filters: TransactionFilters, period_fn: str) -> list[dict[str, Any]]:
         where, params = filters.to_sql()
         where = f"{where} AND area_sqft > 0" if where else "WHERE area_sqft > 0"
@@ -514,6 +553,21 @@ class PrivateResidentialRepository:
         sql = PROJECT_PROFILE_SQL.substitute(table=self._table)
         rows = self._accessor.query(sql, {"project": project})
         return rows[0] if rows else None
+
+    def sale_psf(
+        self, projects: list[str], area_low: float, area_high: float, start_date: date
+    ) -> list[dict[str, Any]]:
+        """Resale psf per project in a size band, for rental yields."""
+        sql = PROJECT_SALE_PSF_SQL.substitute(table=self._table)
+        return self._accessor.query(
+            sql,
+            {
+                "projects": list(projects),
+                "area_low": area_low,
+                "area_high": area_high,
+                "start_date": start_date.isoformat(),
+            },
+        )
 
     def find_peers_by_distance(
         self,

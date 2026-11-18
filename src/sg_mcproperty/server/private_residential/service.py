@@ -9,7 +9,10 @@ import re
 from dataclasses import replace
 from datetime import date, datetime
 from statistics import median
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
+
+from sg_mcproperty.server.private_rental import PrivateRentalRepository
+from sg_mcproperty.server.private_rental import returns as rental_returns
 
 from . import regression
 from .filters import (
@@ -55,6 +58,8 @@ LEASE_CAP_YEARS = 99
 LONG_LEASE_YEARS = 900  # tenures this long behave like freehold
 WIDE_INTERVAL_RATIO = 1.5
 COMPARABLE_AREA_BAND = 0.2
+# An income value this far from the regression estimate means the two methods disagree.
+HIGH_DIVERGENCE_PCT = 20.0
 
 # market_activity: periods compared (recent vs the same number before) and months per period
 ACTIVITY_WINDOW = {"month": 3, "quarter": 2, "year": 1}
@@ -126,6 +131,15 @@ class PeerGroupStats(PsfStats):
     projects: int
 
 
+class RentalBand(TypedDict):
+    reference_area_sqft: float
+    band_low_sqft: float
+    band_high_sqft: float
+    window_start: str
+    window_end: str
+    peers_with_yield: int
+
+
 class TargetProject(TypedDict):
     street: str
     district: int
@@ -133,6 +147,7 @@ class TargetProject(TypedDict):
     tenure: str
     lease_year: int | None
     stats: PsfStats | None
+    gross_yield_pct: NotRequired[float | None]
 
 
 class PeerProject(TypedDict):
@@ -146,6 +161,7 @@ class PeerProject(TypedDict):
     median_psf: float | None
     median_price: float | None
     distance_m: int | None
+    gross_yield_pct: NotRequired[float | None]
 
 
 class IndicativeValue(TypedDict):
@@ -167,6 +183,7 @@ class NearbyComparison(TypedDict):
     peer_group: PeerGroupStats | None
     premium_pct: float | None
     indicative_value: IndicativeValue | None
+    rental: RentalBand | None
     notes: list[str]
 
 
@@ -181,6 +198,16 @@ class CoordinateCoverage(TypedDict):
     transactions_pct: float | None
 
 
+class RentalInfo(TypedDict):
+    leases: int
+    projects: int
+    first_month: str | None
+    last_month: str | None
+    sale_projects: int
+    sale_projects_with_rentals: int
+    sale_projects_with_rentals_pct: float | None
+
+
 class DatasetInfo(TypedDict):
     transactions: int
     projects: int
@@ -190,6 +217,7 @@ class DatasetInfo(TypedDict):
     types_of_sale: list[str]
     segments: list[SegmentInfo]
     coordinate_coverage: CoordinateCoverage
+    rental: RentalInfo | None
     notes: list[str]
 
 
@@ -284,6 +312,29 @@ class ComparableCheck(TypedDict):
     implied_value: int | None
 
 
+class RentalEstimate(TypedDict):
+    reference_area_sqft: float
+    band_low_sqft: float
+    band_high_sqft: float
+    window_start: str
+    window_end: str
+    rentals: int
+    median_monthly_rent: float | None
+    rent_psf_month: float | None
+    annual_rent: int | None
+    sale_psf: float | None
+    sales: int
+    gross_yield_pct: float | None
+
+
+class IncomeCrossCheck(TypedDict):
+    peer_gross_yield_pct: float
+    peer_projects: int
+    annual_rent: int | None
+    implied_value: int | None
+    divergence_pct: float | None
+
+
 class ActivitySnapshot(TypedDict):
     sales_in_sample: int
     last_3_months: int
@@ -303,6 +354,8 @@ class ValueEstimate(TypedDict):
     model: ModelStats | None
     effects: ValueEffects | None
     comparable_check: ComparableCheck | None
+    rental: RentalEstimate | None
+    income_cross_check: IncomeCrossCheck | None
     activity: ActivitySnapshot
     peers: list[PeerProject]
     notes: list[str]
@@ -348,6 +401,8 @@ class GrowthStats(TypedDict):
     median_psf: float | None
     median_price: float | None
     annual_growth_pct: float | None
+    gross_yield_pct: NotRequired[float | None]
+    total_return_pct: NotRequired[float | None]
 
 
 class GrowthPeer(GrowthStats):
@@ -372,6 +427,8 @@ class NearbyGrowth(TypedDict):
     peers: list[GrowthPeer]
     projects_compared: int
     insufficient_data: int
+    ranking_basis: str
+    rental: RentalBand | None
     notes: list[str]
 
 
@@ -385,6 +442,16 @@ class AffordableProject(TypedDict):
     median_psf: float | None
     min_area_sqft: float | None
     max_area_sqft: float | None
+
+
+class ProjectYield(TypedDict):
+    project: str
+    gross_yield_pct: float | None
+    rent_psf_month: float | None
+    median_monthly_rent: float | None
+    sale_psf: float | None
+    rentals: int
+    sales: int
 
 
 class MortgageAssumptions(TypedDict):
@@ -536,8 +603,15 @@ def _clamp(limit: int, maximum: int) -> int:
 class PrivateResidentialService:
     """The use cases the MCP layer calls: validate, apply limits, shape results."""
 
-    def __init__(self, repository: PrivateResidentialRepository) -> None:
+    def __init__(
+        self,
+        repository: PrivateResidentialRepository,
+        rental_repository: PrivateRentalRepository | None = None,
+    ) -> None:
         self._repository = repository
+        # Optional so the server still starts when only the sales table is loaded. Tools that
+        # want a rental yield check `_rentals is None` and report the enrichment as missing.
+        self._rentals = rental_repository
 
     def search_projects(
         self, name_query: str, district: int | None = None, limit: int = 10
@@ -643,7 +717,42 @@ class PrivateResidentialService:
             }
 
         peers = self._peer_projects(peer_rows)
+        rental: RentalBand | None = None
+        yields: dict[str, ProjectYield] = {}
+        if query.area_sqft is not None and self._rentals is not None:
+            names = [query.project, *(p["project"] for p in peers)]
+            yields = self.rental_yields(names, query.area_sqft, window_end)
+            rental_low, rental_high = rental_returns.area_bounds(query.area_sqft)
+            rental_start, rental_end = self._rental_window()
+            rental = {
+                "reference_area_sqft": query.area_sqft,
+                "band_low_sqft": round(rental_low),
+                "band_high_sqft": round(rental_high),
+                "window_start": rental_start.isoformat(),
+                "window_end": rental_end.isoformat(),
+                "peers_with_yield": sum(
+                    1
+                    for peer in peers
+                    if (peer_yield := yields.get(peer["project"])) is not None
+                    and peer_yield["gross_yield_pct"] is not None
+                ),
+            }
+        for peer in peers:
+            peer_yield = yields.get(peer["project"])
+            peer["gross_yield_pct"] = None if peer_yield is None else peer_yield["gross_yield_pct"]
+
+        target_yield = yields.get(query.project)
+        target_yield_pct = None if target_yield is None else target_yield["gross_yield_pct"]
         notes = self._nearby_notes(query, profile, basis, target, peer_rows, peer_group)
+        notes.extend(
+            self._nearby_rental_notes(
+                query,
+                rental,
+                peers,
+                target_yield_pct is not None,
+                self._rentals is not None,
+            )
+        )
         return {
             "project": query.project,
             "segment": segment,
@@ -658,11 +767,13 @@ class PrivateResidentialService:
                 "tenure": profile["tenure"],
                 "lease_year": target_lease_year,
                 "stats": target,
+                "gross_yield_pct": target_yield_pct,
             },
             "peers": peers,
             "peer_group": peer_group,
             "premium_pct": premium,
             "indicative_value": indicative,
+            "rental": rental,
             "notes": notes,
         }
 
@@ -723,6 +834,48 @@ class PrivateResidentialService:
                     f"{other} of {len(peer_rows)} peers have a different tenure type "
                     "(freehold vs leasehold): set same_tenure_type=true for a stricter match."
                 )
+        return notes
+
+    @staticmethod
+    def _nearby_rental_notes(
+        query: NearbyQuery,
+        rental: RentalBand | None,
+        peers: list[PeerProject],
+        target_has_yield: bool,
+        rentals_loaded: bool,
+    ) -> list[str]:
+        """Say why a yield column is missing, or how to read the one that is present."""
+        if not rentals_loaded:
+            return ["Rental contracts are not loaded, so no rental yield is shown."]
+        if query.area_sqft is None:
+            return [
+                (
+                    "No area_sqft given, so no rental yield is shown: a yield is only "
+                    "comparable between similar-sized units."
+                )
+            ]
+
+        notes: list[str] = []
+        if rental is None or rental["peers_with_yield"] == 0:
+            notes.append(
+                "No peer had both rents and resales in the size band, so no peer yield is shown."
+            )
+        else:
+            missing = sum(1 for peer in peers if peer.get("gross_yield_pct") is None)
+            if missing:
+                notes.append(
+                    f"{missing} of {len(peers)} peers have no usable rental yield in the band."
+                )
+            notes.append(
+                "Rental yield is gross: it ignores stamp duty, agent fees, property tax, "
+                "maintenance, vacancy and income tax."
+            )
+        if not target_has_yield:
+            notes.append("The project has no usable rental yield in the band.")
+        if query.type_of_sale == "New Sale":
+            notes.append(
+                "Yields use Resale and Sub Sale prices even though the comparison uses New Sale."
+            )
         return notes
 
     def _require_profile(self, project: str) -> dict[str, Any]:
@@ -854,6 +1007,8 @@ class PrivateResidentialService:
                 + (["project_levels"] if model.mode == "project" else []),
             }
 
+        rental, income_cross_check = self._rental_side(query, peer_rows, band, window_end)
+
         in_band = [
             s for s in sales if abs(s.area_sqft / query.area_sqft - 1) <= COMPARABLE_AREA_BAND
         ]
@@ -887,6 +1042,9 @@ class PrivateResidentialService:
         notes = self._valuation_notes(
             query, basis, sale_type, sales, model, band, rows, unit, use_floor
         )
+        notes.extend(
+            self._rental_notes(rental, income_cross_check, self._rentals is not None, band)
+        )
         return {
             "project": query.project,
             "segment": segment,
@@ -905,6 +1063,8 @@ class PrivateResidentialService:
             "model": model_stats,
             "effects": effects,
             "comparable_check": check,
+            "rental": rental,
+            "income_cross_check": income_cross_check,
             "activity": activity,
             "peers": self._peer_projects(peer_rows),
             "notes": notes,
@@ -999,6 +1159,193 @@ class PrivateResidentialService:
         average = sum(levels[p] * counts[p] for p in levels) / total
         return _pct(-average)
 
+    def _rental_window(self) -> tuple[date, date]:
+        """The rent window: the latest `YIELD_RENT_MONTHS` months in the rental table.
+
+        Anchored on the rental table, never on the sales table: URA publishes the two with
+        different lags, so a rent window keyed off the sales month could end before the newest
+        leases.
+        """
+        if self._rentals is None:
+            raise RuntimeError("rental repository is not configured")
+        last = self._rentals.latest_month()
+        end = last.date() if isinstance(last, datetime) else last
+        return add_months(end, -(rental_returns.YIELD_RENT_MONTHS - 1)), end
+
+    def _rental_side(
+        self,
+        query: ValuationQuery,
+        peer_rows: list[dict[str, Any]],
+        band: ValueBand | None,
+        window_end: date,
+    ) -> tuple[RentalEstimate | None, IncomeCrossCheck | None]:
+        """The rental overlay and income cross-check for a valuation, or (None, None).
+
+        The yield is always measured on units within +/-20% of the requested size: rent psf
+        falls with unit size, so an unbanded comparison would mostly rank unit mix. The
+        cross-check capitalises the unit's rent at the *median* yield of its peers, not at the
+        project's own yield, so it is an independent second opinion rather than a restatement
+        of the overlay.
+        """
+        if self._rentals is None:
+            return None, None
+        names = [query.project, *(p["project"] for p in peer_rows)]
+        yields = self.rental_yields(names, query.area_sqft, window_end)
+        target = yields.get(query.project)
+        if target is None:
+            return None, None
+
+        low, high = rental_returns.area_bounds(query.area_sqft)
+        rental_start, rental_end = self._rental_window()
+        annual = rental_returns.annual_rent(target["rent_psf_month"], query.area_sqft)
+        rental: RentalEstimate = {
+            "reference_area_sqft": query.area_sqft,
+            "band_low_sqft": round(low),
+            "band_high_sqft": round(high),
+            "window_start": rental_start.isoformat(),
+            "window_end": rental_end.isoformat(),
+            "rentals": target["rentals"],
+            "median_monthly_rent": target["median_monthly_rent"],
+            "rent_psf_month": target["rent_psf_month"],
+            "annual_rent": annual,
+            "sale_psf": target["sale_psf"],
+            "sales": target["sales"],
+            "gross_yield_pct": target["gross_yield_pct"],
+        }
+
+        peer_yields: list[float] = []
+        for project, row in yields.items():
+            peer_yield = row["gross_yield_pct"]
+            if (
+                project != query.project
+                and peer_yield is not None
+                and rental_returns.plausible_yield(peer_yield)
+            ):
+                peer_yields.append(peer_yield)
+
+        cross_check: IncomeCrossCheck | None = None
+        if annual is not None and len(peer_yields) >= rental_returns.MIN_PEER_PROJECTS:
+            peer_yield = round(median(peer_yields), 2)
+            implied = rental_returns.implied_value(annual, peer_yield)
+            estimate = None if band is None else band["median"]
+            cross_check = {
+                "peer_gross_yield_pct": peer_yield,
+                "peer_projects": len(peer_yields),
+                "annual_rent": annual,
+                "implied_value": implied,
+                "divergence_pct": rental_returns.divergence_pct(implied, estimate),
+            }
+        return rental, cross_check
+
+    @staticmethod
+    def _rental_notes(
+        rental: RentalEstimate | None,
+        cross_check: IncomeCrossCheck | None,
+        rentals_loaded: bool,
+        band: ValueBand | None,
+    ) -> list[str]:
+        """Say why rental figures are missing, and how to read the ones that are present."""
+        if not rentals_loaded:
+            return ["Rental contracts are not loaded, so there is no rental yield or income check."]
+        if rental is None:
+            return [
+                (
+                    "No rental contracts for this project in the size band over the last "
+                    f"{rental_returns.YIELD_RENT_MONTHS} months, so there is no rental yield."
+                )
+            ]
+
+        notes: list[str] = []
+        if rental["gross_yield_pct"] is not None:
+            notes.append(
+                "Rental yield is gross: it ignores stamp duty, agent fees, property tax, "
+                "maintenance, vacancy and income tax."
+            )
+        else:
+            notes.append(
+                f"The yield needs at least {rental_returns.MIN_RENTALS} rentals and "
+                f"{rental_returns.MIN_SALES} resales in the band; this band has "
+                f"{rental['rentals']} and {rental['sales']}."
+            )
+
+        if cross_check is None:
+            if rental["annual_rent"] is None:
+                notes.append("There is no rent per sqft to capitalise, so no income cross-check.")
+            else:
+                notes.append(
+                    f"Fewer than {rental_returns.MIN_PEER_PROJECTS} nearby projects had a "
+                    "usable yield, so rent is not cross-checked against peer income yields."
+                )
+            return notes
+
+        notes.append(
+            "Income cross-check: annual rent capitalised at the median nearby gross yield "
+            f"({cross_check['peer_gross_yield_pct']}% across {cross_check['peer_projects']} "
+            f"projects) gives ${cross_check['implied_value']:,}."
+        )
+        divergence = cross_check["divergence_pct"]
+        if divergence is None:
+            if band is None:
+                notes.append("There is no regression estimate to compare the income value with.")
+        elif abs(divergence) >= HIGH_DIVERGENCE_PCT:
+            side = "above" if divergence > 0 else "below"
+            notes.append(
+                f"The income value is {abs(divergence):.0f}% {side} the regression estimate: "
+                "the two methods disagree, so treat both with care."
+            )
+        return notes
+
+    def rental_yields(
+        self, projects: list[str], area_sqft: float, window_end: date | None = None
+    ) -> dict[str, ProjectYield]:
+        """Gross rental yields for `projects`, measured on units of `area_sqft` (+/-20%).
+
+        Both sides of the ratio use the same size band: rent psf falls with unit size, so a
+        project-wide average would mostly rank unit mix. Returns one entry per project with
+        rentals in the band. `gross_yield_pct` is null when either side is too thin, but the
+        counts are still reported so the caller can say why.
+
+        `window_end` is the last month of sales to use; pass the caller's own window end to
+        avoid a second coverage query.
+        """
+        if self._rentals is None or not projects:
+            return {}
+        names = list(projects)
+        area_low, area_high = rental_returns.area_bounds(area_sqft)
+        if window_end is None:
+            window_end = self._repository.coverage()["last_month"].date()
+        sale_start = add_months(window_end, -(rental_returns.YIELD_SALE_MONTHS - 1))
+        sales = {
+            row["project"]: row
+            for row in self._repository.sale_psf(names, area_low, area_high, sale_start)
+        }
+        rows = self._rentals.yield_for_projects(
+            names, area_low, area_high, rental_returns.YIELD_RENT_MONTHS
+        )
+
+        yields: dict[str, ProjectYield] = {}
+        for row in rows:
+            sale = sales.get(row["project"], {})
+            rentals = row["rentals"] or 0
+            sale_count = sale.get("sales") or 0
+            rent_psf = _num(row["rent_psf_month"])
+            sale_psf = _num(sale.get("median_psf"))
+            enough = (
+                rentals >= rental_returns.MIN_RENTALS and sale_count >= rental_returns.MIN_SALES
+            )
+            yields[row["project"]] = {
+                "project": row["project"],
+                "gross_yield_pct": (
+                    rental_returns.gross_yield_pct(rent_psf, sale_psf) if enough else None
+                ),
+                "rent_psf_month": None if rent_psf is None else round(rent_psf, 2),
+                "median_monthly_rent": _num(row["median_monthly_rent"]),
+                "sale_psf": sale_psf,
+                "rentals": rentals,
+                "sales": sale_count,
+            }
+        return yields
+
     def income_budget(
         self,
         monthly_income: float,
@@ -1019,6 +1366,17 @@ class PrivateResidentialService:
         }
         return max_price, assumptions
 
+    @staticmethod
+    def _growth_reference_area(query: GrowthQuery) -> float | None:
+        """The area a growth-scan yield is measured around: the middle of the caller's band.
+
+        Returns None when the caller gave no band, so the scan can fall back to the anchor
+        project's median sale area.
+        """
+        if query.min_area_sqft is not None and query.max_area_sqft is not None:
+            return (query.min_area_sqft + query.max_area_sqft) / 2
+        return query.min_area_sqft if query.min_area_sqft is not None else query.max_area_sqft
+
     def rank_nearby_growth(self, query: GrowthQuery) -> NearbyGrowth:
         """Rank the nearest projects by their resale psf trend, not their current price."""
         repo = self._repository
@@ -1031,6 +1389,19 @@ class PrivateResidentialService:
                 "or district."
             )
         window_end = repo.coverage()["last_month"].date()
+        # Yields are matched on unit size. If the caller gave a band, it sets the reference;
+        # otherwise use the anchor's own median sale area, and apply the same band to the
+        # growth scan so both legs of total return are measured on like-for-like units.
+        reference_area = self._growth_reference_area(query)
+        used_fallback = False
+        if query.include_rental and reference_area is None and self._rentals is not None:
+            probe = repo.project_growth(query)
+            median_area = _num(probe.get("median_area_sqft"))
+            if median_area is not None:
+                low, high = (round(value) for value in rental_returns.area_bounds(median_area))
+                query = replace(query, min_area_sqft=low, max_area_sqft=high)
+                reference_area = median_area
+                used_fallback = True
         rows = repo.nearby_growth(query, x, y)
         target_row = repo.project_growth(query)
         target_growth = _num(target_row["annual_growth"])
@@ -1046,26 +1417,72 @@ class PrivateResidentialService:
             "annual_growth_pct": (None if target_growth is None else round(target_growth * 100, 1)),
         }
 
+        rental: RentalBand | None = None
+        yields: dict[str, ProjectYield] = {}
+        total_return_ranking = False
+        if query.include_rental and reference_area is not None and self._rentals is not None:
+            names = [query.project, *(row["project"] for row in rows)]
+            yields = self.rental_yields(names, reference_area, window_end)
+            low, high = rental_returns.area_bounds(reference_area)
+            rental_start, rental_end = self._rental_window()
+            rental = {
+                "reference_area_sqft": reference_area,
+                "band_low_sqft": round(low),
+                "band_high_sqft": round(high),
+                "window_start": rental_start.isoformat(),
+                "window_end": rental_end.isoformat(),
+                "peers_with_yield": sum(
+                    1
+                    for row in rows
+                    if (row_yield := yields.get(row["project"])) is not None
+                    and row_yield["gross_yield_pct"] is not None
+                ),
+            }
+            total_return_ranking = True
+
+        if query.include_rental:
+            target_yield = yields.get(query.project)
+            target_yield_pct = None if target_yield is None else target_yield["gross_yield_pct"]
+            target["gross_yield_pct"] = target_yield_pct
+            target["total_return_pct"] = rental_returns.total_return_pct(
+                target_yield_pct, target["annual_growth_pct"]
+            )
+
         peers: list[GrowthPeer] = []
         for row in rows:
             stats = _growth_row(row)
+            peer_yield = yields.get(stats["project"])
+            peer_yield_pct = None if peer_yield is None else peer_yield["gross_yield_pct"]
             peers.append(
                 {
                     **stats,
                     "distance_m": int(row["distance_m"]),
-                    "better_than_target": (
-                        stats["annual_growth_pct"] is not None
-                        and target["annual_growth_pct"] is not None
-                        and stats["annual_growth_pct"] > target["annual_growth_pct"]
+                    "better_than_target": False,
+                    **(
+                        {
+                            "gross_yield_pct": peer_yield_pct,
+                            "total_return_pct": rental_returns.total_return_pct(
+                                peer_yield_pct, stats["annual_growth_pct"]
+                            ),
+                        }
+                        if query.include_rental
+                        else {}
                     ),
                 }
+            )
+
+        rank_key = "total_return_pct" if total_return_ranking else "annual_growth_pct"
+        for peer in peers:
+            peer_value, target_value = peer.get(rank_key), target.get(rank_key)
+            peer["better_than_target"] = (
+                peer_value is not None and target_value is not None and peer_value > target_value
             )
         ranked = [
             p
             for p in peers
-            if p["transactions"] >= query.min_transactions and p["annual_growth_pct"] is not None
+            if p["transactions"] >= query.min_transactions and p.get(rank_key) is not None
         ]
-        ranked.sort(key=lambda p: p["annual_growth_pct"] or 0, reverse=True)
+        ranked.sort(key=lambda p: p.get(rank_key) or 0, reverse=True)
         ranked_names = {p["project"] for p in ranked}
         insufficient = [p for p in peers if p["project"] not in ranked_names]
 
@@ -1083,7 +1500,26 @@ class PrivateResidentialService:
                 "not a forecast."
             )
         ]
-        if size_band is None:
+        if rank_key == "total_return_pct":
+            notes.append(
+                "Ranked by gross total return: the current gross rental yield plus the realised "
+                "annual psf growth. It is not a forecast, and it excludes stamp duty, agent "
+                "fees, property tax, maintenance, vacancy and income tax."
+            )
+        if used_fallback and size_band is not None:
+            notes.append(
+                f"No size band was given, so the scan and its yields use the anchor's median "
+                f"sale area ({reference_area:.0f} sqft) +/-20%: "
+                f"{size_band['min_area_sqft']:.0f}-{size_band['max_area_sqft']:.0f} sqft."
+            )
+        if query.include_rental and self._rentals is None:
+            notes.append("Rental data is not loaded, so the scan is ranked by growth only.")
+        elif query.include_rental and reference_area is None:
+            notes.append(
+                "The project has no resales in the window, so no size band could be derived "
+                "for yields; the scan is ranked by growth only."
+            )
+        if size_band is None and not used_fallback:
             notes.append(
                 "No size band: units of different sizes are mixed, so psf growth is noisier."
             )
@@ -1094,24 +1530,47 @@ class PrivateResidentialService:
                 f"No project with coordinates within {query.radius_m} m matched these filters."
             )
         elif not ranked:
+            wanted = (
+                "trend and a usable rental yield" if rank_key == "total_return_pct" else "trend"
+            )
             notes.append(
                 f"No peer has {query.min_transactions}+ resales in the band with a measurable "
-                "trend; widen the radius, the window or the size band."
+                f"{wanted}; widen the radius, the window or the size band."
             )
         elif len(ranked) < 5:
             notes.append(
                 f"Only {len(ranked)} peer projects carry a measurable trend: rankings are thin."
             )
-        if target["annual_growth_pct"] is None:
-            notes.append(
-                "The project itself has fewer than 3 resales in the band, so its own growth "
-                "cannot be measured; better_than_target is false for every peer."
-            )
+        if target.get(rank_key) is None:
+            if rank_key == "total_return_pct" and target["annual_growth_pct"] is not None:
+                notes.append(
+                    "The project itself has no usable rental yield in the band, so "
+                    "better_than_target is false for every peer."
+                )
+            else:
+                notes.append(
+                    "The project itself has fewer than 3 resales in the band, so its own growth "
+                    "cannot be measured; better_than_target is false for every peer."
+                )
+        if query.include_rental and yields:
+            no_yield = sum(1 for p in peers if p.get("gross_yield_pct") is None)
+            if no_yield:
+                notes.append(
+                    f"{no_yield} of {len(peers)} peers have no usable rental yield in the band; "
+                    "they are not ranked by total return."
+                )
         if insufficient:
+            reason = (
+                "fewer than "
+                f"{query.min_transactions} resales in the band, no measurable trend or no "
+                "usable rental yield"
+                if rank_key == "total_return_pct"
+                else f"fewer than {query.min_transactions} resales in the band or no "
+                "measurable trend"
+            )
             notes.append(
-                f"{len(insufficient)} of {len(peers)} peers have fewer than "
-                f"{query.min_transactions} resales in the band or no measurable trend; they "
-                "are listed after the ranked peers without a ranking."
+                f"{len(insufficient)} of {len(peers)} peers have {reason}; they are listed "
+                "after the ranked peers without a ranking."
             )
         notes.append("Projects without coordinates cannot be scanned and are left out.")
 
@@ -1127,6 +1586,8 @@ class PrivateResidentialService:
             "peers": ranked + insufficient,
             "projects_compared": len(ranked),
             "insufficient_data": len(insufficient),
+            "ranking_basis": rank_key,
+            "rental": rental,
             "notes": notes,
         }
 
@@ -1277,6 +1738,40 @@ class PrivateResidentialService:
             )
         if "unknown" in counts or any(s["segment"] == "unknown" for s in segments):
             notes.append("Some rows have no property type: reload the data.")
+
+        rental: RentalInfo | None = None
+        if self._rentals is not None:
+            rental_coverage = self._rentals.coverage()
+            leases = rental_coverage["rentals"] or 0
+            overlap = repo.rental_project_overlap(self._rentals.table_name)["with_rentals"] or 0
+            sale_projects = coverage["projects"]
+            rental = {
+                "leases": leases,
+                "projects": rental_coverage["projects"] or 0,
+                "first_month": _iso(rental_coverage["first_month"]) if leases else None,
+                "last_month": _iso(rental_coverage["last_month"]) if leases else None,
+                "sale_projects": sale_projects,
+                "sale_projects_with_rentals": overlap,
+                "sale_projects_with_rentals_pct": (
+                    round(overlap / sale_projects * 100, 1) if sale_projects else None
+                ),
+            }
+            notes.append(
+                f"Rental contracts are a separate URA release, latest {rental['last_month']}. "
+                "Yields are gross and measured on units within 20% of the same size."
+            )
+            share = rental["sale_projects_with_rentals_pct"]
+            if share is not None and share < 100:
+                notes.append(
+                    f"{share}% of sale projects also have rental contracts; the rest have no "
+                    "yield and are not ranked by total return."
+                )
+        else:
+            notes.append(
+                "Rental contracts are not loaded, so estimate_value has no rental yield and "
+                "rank_nearby_growth cannot rank by total return."
+            )
+
         return {
             **coverage,
             "districts": list(facets["districts"]),
@@ -1286,6 +1781,7 @@ class PrivateResidentialService:
                 "projects_pct": projects_pct,
                 "transactions_pct": transactions_pct,
             },
+            "rental": rental,
             "notes": notes,
         }
 

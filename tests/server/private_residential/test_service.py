@@ -1,9 +1,10 @@
 import math
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
 from sg_mcproperty.accessor import ClickHouseAccessor
+from sg_mcproperty.server.private_rental import PrivateRentalRepository
 from sg_mcproperty.server.private_residential import (
     AffordabilityQuery,
     GrowthQuery,
@@ -21,6 +22,7 @@ from sg_mcproperty.server.private_residential.service import (
 
 from .helpers import (
     FakeAnalysisRepository,
+    FakeRentalRepository,
     FakeRepository,
     activity_row,
     affordable_row,
@@ -30,6 +32,8 @@ from .helpers import (
     profile_row,
     project_growth_row,
     project_row,
+    rental_yield_row,
+    sale_psf_row,
     stats_row,
     summary_row,
     synthetic_sample,
@@ -137,8 +141,8 @@ def test_price_trend_rejects_bad_period():
 # --- compare nearby -----------------------------------------------------------------------------
 
 
-def _nearby(repo, **kwargs):
-    return PrivateResidentialService(repo).compare_nearby(
+def _nearby(repo, rentals=None, **kwargs):
+    return PrivateResidentialService(repo, rentals).compare_nearby(
         NearbyQuery.from_inputs("target", **kwargs)
     )
 
@@ -244,11 +248,99 @@ def test_nearby_same_tenure_type_filters_peers():
     assert repo.calls[1][4].freehold is True
 
 
+def test_nearby_yields_use_the_same_size_band_for_target_and_peers():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        distance_peers=[peer_row("A", 400), peer_row("B", 900)],
+        target=stats_row(transactions=30, median=2400.0),
+        pooled=stats_row(transactions=60, projects=2),
+        sale_psf_rows=[sale_psf_row("TARGET", 10, 2500.0), sale_psf_row("A", 10, 2000.0)],
+    )
+    rentals = FakeRentalRepository(
+        yields=[
+            rental_yield_row("TARGET", rentals=5, rent_psf=5.0, rent=9500.0),
+            rental_yield_row("A", rentals=8, rent_psf=4.0, rent=6000.0),
+        ]
+    )
+    out = _nearby(repo, rentals, area_sqft=1000)
+
+    assert out["target"]["gross_yield_pct"] == 2.4  # 12 * 5.0 / 2500
+    assert [p["gross_yield_pct"] for p in out["peers"]] == [2.4, None]
+    assert out["rental"] == {
+        "reference_area_sqft": 1000.0,
+        "band_low_sqft": 800,
+        "band_high_sqft": 1200,
+        "window_start": "2025-11-01",
+        "window_end": "2026-10-01",
+        "peers_with_yield": 1,
+    }
+    assert ("yield_for_projects", ["TARGET", "A", "B"], 800.0, 1200.0, 12) in rentals.calls
+    assert ("latest_month",) in rentals.calls
+    sale_call = next(c for c in repo.calls if c[0] == "sale_psf")
+    assert sale_call[1] == ["TARGET", "A", "B"]
+    assert sale_call[2:] == (800.0, 1200.0, date(2024, 12, 1))
+    notes = " | ".join(out["notes"])
+    assert "1 of 2 peers have no usable rental yield" in notes
+    assert "Rental yield is gross" in notes
+
+
+def test_nearby_without_area_sqft_explains_why_no_yield_is_shown():
+    rentals = FakeRentalRepository(yields=[rental_yield_row("TARGET")])
+    out = _nearby(
+        FakeAnalysisRepository(profile=profile_row(), distance_peers=[peer_row()]), rentals
+    )
+
+    assert out["rental"] is None
+    assert out["target"]["gross_yield_pct"] is None
+    assert [p["gross_yield_pct"] for p in out["peers"]] == [None]
+    assert rentals.calls == []
+    assert any("No area_sqft given" in n for n in out["notes"])
+
+
+def test_nearby_without_rentals_says_no_yield_is_shown():
+    out = _nearby(FakeAnalysisRepository(profile=profile_row()), area_sqft=1000)
+
+    assert out["rental"] is None
+    assert any("Rental contracts are not loaded" in n for n in out["notes"])
+
+
+def test_nearby_band_with_no_peer_yield_says_so():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        distance_peers=[peer_row("A")],
+        target=stats_row(transactions=30),
+        pooled=stats_row(transactions=30, projects=1),
+        sale_psf_rows=[sale_psf_row("TARGET", 10, 2500.0)],
+    )
+    rentals = FakeRentalRepository(yields=[rental_yield_row("TARGET", rentals=5, rent_psf=5.0)])
+    out = _nearby(repo, rentals, area_sqft=1000)
+
+    assert out["target"]["gross_yield_pct"] == 2.4
+    assert out["rental"]["peers_with_yield"] == 0
+    notes = " | ".join(out["notes"])
+    assert "No peer had both rents and resales in the size band" in notes
+
+
+def test_nearby_new_sale_flags_that_yields_use_resale_prices():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        distance_peers=[peer_row()],
+        target=stats_row(transactions=30),
+        pooled=stats_row(transactions=30),
+        sale_psf_rows=[sale_psf_row("TARGET", 10, 2500.0)],
+    )
+    rentals = FakeRentalRepository(yields=[rental_yield_row("TARGET", rentals=5, rent_psf=5.0)])
+    out = _nearby(repo, rentals, area_sqft=1000, type_of_sale="New Sale")
+
+    assert any("Yields use Resale and Sub Sale prices" in n for n in out["notes"])
+
+
 # --- dataset info -------------------------------------------------------------------------------
 
 
-def _dataset_info(**kwargs):
-    return PrivateResidentialService(FakeAnalysisRepository(**kwargs)).dataset_info()
+def _dataset_info(rentals=None, **kwargs):
+    service = PrivateResidentialService(FakeAnalysisRepository(**kwargs), rentals)
+    return service.dataset_info()
 
 
 def test_dataset_info_groups_property_types_into_segments_in_order():
@@ -299,6 +391,49 @@ def test_dataset_info_has_no_coverage_note_when_complete_and_handles_nan():
         )
     )
     assert empty["coordinate_coverage"] == {"projects_pct": None, "transactions_pct": None}
+
+
+def test_dataset_info_reports_rental_coverage_and_project_overlap():
+    rentals = FakeRentalRepository(
+        coverage={
+            "rentals": 450_669,
+            "projects": 3_225,
+            "first_month": datetime(2021, 11, 1),
+            "last_month": datetime(2026, 10, 1),
+        }
+    )
+    repo = FakeAnalysisRepository(
+        coverage={
+            "transactions": 100_000,
+            "projects": 2_959,
+            "first_month": datetime(2021, 11, 1),
+            "last_month": datetime(2026, 11, 1),
+        },
+        rental_overlap=2_753,
+    )
+    out = PrivateResidentialService(repo, rentals).dataset_info()
+
+    rental = out["rental"]
+    assert rental == {
+        "leases": 450_669,
+        "projects": 3_225,
+        "first_month": "2021-11-01",
+        "last_month": "2026-10-01",
+        "sale_projects": 2_959,
+        "sale_projects_with_rentals": 2_753,
+        "sale_projects_with_rentals_pct": 93.0,
+    }
+    assert ("rental_project_overlap", "db.private_residential_rentals") in repo.calls
+    notes = " | ".join(out["notes"])
+    assert "Rental contracts are a separate URA release, latest 2026-10-01" in notes
+    assert "93.0% of sale projects also have rental contracts" in notes
+
+
+def test_dataset_info_without_rentals_says_what_is_missing():
+    out = _dataset_info()
+
+    assert out["rental"] is None
+    assert any("Rental contracts are not loaded" in note for note in out["notes"])
 
 
 # --- project summary ----------------------------------------------------------------------------
@@ -561,6 +696,140 @@ def test_estimate_value_unknown_project():
         )
 
 
+# --- estimate value: rental overlay and income cross-check --------------------------------------
+
+RENTAL_PEERS = [
+    peer_row("NEAR A", 400),
+    peer_row("NEAR B", 900),
+    peer_row("NEAR C", 1200),
+]
+
+
+def _estimate_with_rentals(
+    rental_rows=None,
+    sale_psf_rows=None,
+    peers=None,
+    rental_repository="default",
+    query=None,
+):
+    peers = RENTAL_PEERS if peers is None else peers
+    names = ["TARGET", *(p["project"] for p in peers)]
+    if sale_psf_rows is None:
+        sale_psf_rows = [sale_psf_row(name) for name in names]
+    if rental_rows is None:
+        rent_psf = {"TARGET": 7.5, "NEAR A": 4.0, "NEAR B": 5.0, "NEAR C": 6.0}
+        rental_rows = [
+            rental_yield_row(name, rentals=10, rent_psf=rent_psf[name]) for name in names
+        ]
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        distance_peers=peers,
+        sample=synthetic_sample(LEVELS),
+        sale_psf_rows=sale_psf_rows,
+    )
+    rentals = (
+        FakeRentalRepository(yields=rental_rows)
+        if rental_repository == "default"
+        else rental_repository
+    )
+    service = PrivateResidentialService(repo, rentals)
+    out = service.estimate_value(query or ValuationQuery.from_inputs("target", 1000, floor=12))
+    return out, rentals
+
+
+def test_estimate_value_adds_a_rental_overlay_on_the_units_size_band():
+    out, rentals = _estimate_with_rentals()
+
+    rental = out["rental"]
+    assert rental["reference_area_sqft"] == 1000
+    assert (rental["band_low_sqft"], rental["band_high_sqft"]) == (800, 1200)
+    assert (rental["window_start"], rental["window_end"]) == ("2025-11-01", "2026-10-01")
+    assert rental["rentals"] == 10 and rental["sales"] == 10
+    assert rental["rent_psf_month"] == 7.5 and rental["annual_rent"] == 90_000
+    assert rental["sale_psf"] == 2000.0 and rental["gross_yield_pct"] == 4.5
+    # Rents are queried on the same +/-20% band, not the whole project.
+    assert rentals.calls[0] == (
+        "yield_for_projects",
+        ["TARGET", "NEAR A", "NEAR B", "NEAR C"],
+        800.0,
+        1200.0,
+        12,
+    )
+
+
+def test_income_cross_check_uses_the_peer_median_not_the_targets_own_yield():
+    out, _ = _estimate_with_rentals()
+
+    cross = out["income_cross_check"]
+    # Peer yields are 2.4%, 3.0% and 3.6%; the target's own 4.5% must not be mixed in.
+    assert cross["peer_gross_yield_pct"] == 3.0
+    assert cross["peer_projects"] == 3
+    assert cross["annual_rent"] == 90_000
+    assert cross["implied_value"] == 3_000_000
+    expected = round((3_000_000 / out["estimate"]["median"] - 1) * 100, 1)
+    assert cross["divergence_pct"] == expected
+    assert any("below the regression estimate" in note for note in out["notes"])
+
+
+def test_income_cross_check_needs_three_usable_peer_projects():
+    out, _ = _estimate_with_rentals(peers=RENTAL_PEERS[:2])
+
+    assert out["rental"]["gross_yield_pct"] == 4.5
+    assert out["income_cross_check"] is None
+    assert any("Fewer than 3 nearby projects" in note for note in out["notes"])
+
+
+def test_income_cross_check_ignores_implausible_peer_yields():
+    # A 12% peer yield is a mismatched pair, not a return, so it does not count towards three.
+    rental_rows = [
+        rental_yield_row("TARGET", rentals=10, rent_psf=7.5),
+        rental_yield_row("NEAR A", rentals=10, rent_psf=4.0),
+        rental_yield_row("NEAR B", rentals=10, rent_psf=5.0),
+        rental_yield_row("NEAR C", rentals=10, rent_psf=20.0),
+    ]
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        distance_peers=RENTAL_PEERS,
+        sample=synthetic_sample(LEVELS),
+        sale_psf_rows=[
+            sale_psf_row(project) for project in ("TARGET", "NEAR A", "NEAR B", "NEAR C")
+        ],
+    )
+    out = PrivateResidentialService(repo, FakeRentalRepository(yields=rental_rows)).estimate_value(
+        ValuationQuery.from_inputs("target", 1000, floor=12)
+    )
+
+    assert out["rental"]["gross_yield_pct"] == 4.5
+    assert out["income_cross_check"] is None
+    assert any("Fewer than 3 nearby projects" in note for note in out["notes"])
+
+
+def test_estimate_value_without_rental_data_says_so():
+    out, _ = _estimate_with_rentals(rental_repository=None)
+
+    assert out["rental"] is None and out["income_cross_check"] is None
+    assert any("Rental contracts are not loaded" in note for note in out["notes"])
+
+
+def test_estimate_value_without_leases_in_the_band_says_so():
+    out, _ = _estimate_with_rentals(rental_rows=[rental_yield_row("NEAR A", rent_psf=4.0)])
+
+    assert out["rental"] is None and out["income_cross_check"] is None
+    assert any("No rental contracts for this project" in note for note in out["notes"])
+
+
+def test_estimate_value_keeps_the_rental_block_when_the_price_side_is_thin():
+    out, _ = _estimate_with_rentals(
+        sale_psf_rows=[sale_psf_row("TARGET", sales=1, psf=2000.0)]
+        + [sale_psf_row(project) for project in ("NEAR A", "NEAR B", "NEAR C")]
+    )
+
+    assert out["rental"]["sales"] == 1
+    assert out["rental"]["gross_yield_pct"] is None
+    assert out["income_cross_check"] is not None
+    assert any("needs at least 3 rentals and 2 resales" in note for note in out["notes"])
+
+
 # --- growth scan --------------------------------------------------------------------------------
 
 
@@ -612,6 +881,123 @@ def test_growth_scan_with_no_ranked_peers_explains_why():
 def test_growth_scan_unknown_project():
     with pytest.raises(ValueError, match="search_projects"):
         _growth(FakeAnalysisRepository(profile=None))
+
+
+YIELD_PEERS = [
+    growth_row("HIGH YIELD", distance_m=300, growth=0.020, transactions=10),
+    growth_row("FAST GROWTH", distance_m=500, growth=0.060, transactions=10),
+    growth_row("BALANCED", distance_m=700, growth=0.040, transactions=10),
+]
+
+
+def _rental_growth(rentals=None, **kwargs):
+    names = ["TARGET", "HIGH YIELD", "FAST GROWTH", "BALANCED"]
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        growth_target=project_growth_row(growth=0.039, median_area_sqft=1000),
+        growth_peers=YIELD_PEERS,
+        sale_psf_rows=[sale_psf_row(name) for name in names],
+    )
+    rental_repo = FakeRentalRepository(
+        yields=rentals
+        if rentals is not None
+        else [
+            rental_yield_row("TARGET", rent_psf=5.0),
+            rental_yield_row("HIGH YIELD", rent_psf=8.0),
+            rental_yield_row("FAST GROWTH", rent_psf=2.0),
+            rental_yield_row("BALANCED", rent_psf=6.0),
+        ]
+    )
+    service = PrivateResidentialService(repo, rental_repo)
+    return (
+        service.rank_nearby_growth(GrowthQuery.from_inputs("target", **kwargs)),
+        repo,
+        rental_repo,
+    )
+
+
+def test_growth_scan_with_rental_ranks_by_total_return_not_growth():
+    out, _, rentals = _rental_growth(include_rental=True, min_area_sqft=1200, max_area_sqft=2000)
+
+    assert out["ranking_basis"] == "total_return_pct"
+    # Growth order would be FAST GROWTH, BALANCED, HIGH YIELD; total return reorders it.
+    assert [p["project"] for p in out["peers"]] == ["BALANCED", "FAST GROWTH", "HIGH YIELD"]
+    assert [p["total_return_pct"] for p in out["peers"]] == [7.6, 7.2, 6.8]
+    assert [p["gross_yield_pct"] for p in out["peers"]] == [3.6, 1.2, 4.8]
+    assert [p["better_than_target"] for p in out["peers"]] == [True, True, False]
+    assert out["target"]["gross_yield_pct"] == 3.0
+    assert out["target"]["total_return_pct"] == 6.9
+
+    rental = out["rental"]
+    assert rental["reference_area_sqft"] == 1600
+    assert (rental["band_low_sqft"], rental["band_high_sqft"]) == (1280, 1920)
+    assert rental["peers_with_yield"] == 3
+    assert (rental["window_start"], rental["window_end"]) == ("2025-11-01", "2026-10-01")
+    assert rentals.calls[0] == (
+        "yield_for_projects",
+        ["TARGET", "HIGH YIELD", "FAST GROWTH", "BALANCED"],
+        1280.0,
+        1920.0,
+        12,
+    )
+
+
+def test_growth_scan_derives_the_yield_band_from_the_anchors_median_sale_area():
+    out, repo, _ = _rental_growth(include_rental=True)
+
+    assert out["rental"]["reference_area_sqft"] == 1000
+    assert out["size_band"] == {"min_area_sqft": 800, "max_area_sqft": 1200}
+    assert any("median sale area" in note for note in out["notes"])
+    # First project_growth is the unbanded probe for the median area; the second is the scan.
+    probes = [call for call in repo.calls if call[0] == "project_growth"]
+    assert len(probes) == 2
+    assert probes[1][1].min_area_sqft == 800
+
+
+def test_growth_scan_puts_peers_without_a_yield_after_the_ranked_ones():
+    out, _, _ = _rental_growth(
+        rentals=[
+            rental_yield_row("TARGET", rent_psf=5.0),
+            rental_yield_row("HIGH YIELD", rent_psf=8.0),
+            rental_yield_row("FAST GROWTH", rent_psf=2.0),
+        ],
+        include_rental=True,
+        min_area_sqft=1200,
+        max_area_sqft=2000,
+    )
+
+    assert [p["project"] for p in out["peers"]] == ["FAST GROWTH", "HIGH YIELD", "BALANCED"]
+    assert out["peers"][-1]["total_return_pct"] is None
+    assert out["projects_compared"] == 2 and out["insufficient_data"] == 1
+    assert any("1 of 3 peers have no usable rental yield" in note for note in out["notes"])
+
+
+def test_growth_scan_without_rental_data_falls_back_to_growth():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(),
+        growth_target=project_growth_row(growth=0.039, median_area_sqft=1000),
+        growth_peers=YIELD_PEERS,
+    )
+    out = PrivateResidentialService(repo).rank_nearby_growth(
+        GrowthQuery.from_inputs(
+            "target", min_area_sqft=1200, max_area_sqft=2000, include_rental=True
+        )
+    )
+
+    assert out["ranking_basis"] == "annual_growth_pct"
+    assert out["rental"] is None
+    assert [p["project"] for p in out["peers"]] == ["FAST GROWTH", "BALANCED", "HIGH YIELD"]
+    assert any("Rental data is not loaded" in note for note in out["notes"])
+
+
+def test_growth_scan_without_rental_stays_growth_only():
+    out, _, rentals = _rental_growth(min_area_sqft=1200, max_area_sqft=2000)
+
+    assert out["ranking_basis"] == "annual_growth_pct"
+    assert out["rental"] is None
+    assert "gross_yield_pct" not in out["peers"][0]
+    assert "gross_yield_pct" not in out["target"]
+    assert rentals.calls == []
 
 
 # --- affordability ------------------------------------------------------------------------------
@@ -677,6 +1063,52 @@ def test_affordability_search_empty_explains_how_to_widen():
     assert any("All districts" in note for note in out["notes"])
 
 
+# --- rental yields ------------------------------------------------------------------------------
+
+
+def test_rental_yield_pairs_rents_with_prices_on_the_same_size_band():
+    repo = FakeAnalysisRepository(sale_psf_rows=[sale_psf_row(psf=2414.0, sales=4)])
+    rentals = FakeRentalRepository(yields=[rental_yield_row(rent_psf=5.03, rentals=5)])
+    out = PrivateResidentialService(repo, rentals).rental_yields(["PEER A"], 1905)
+
+    assert out["PEER A"]["gross_yield_pct"] == 2.5
+    assert out["PEER A"]["sale_psf"] == 2414.0
+    assert out["PEER A"]["rentals"] == 5 and out["PEER A"]["sales"] == 4
+    # Both sides are restricted to +/-20% of the reference area, not the whole project.
+    assert repo.calls[0] == ("sale_psf", ["PEER A"], 1524.0, 2286.0, date(2024, 12, 1))
+    assert rentals.calls[0] == ("yield_for_projects", ["PEER A"], 1524.0, 2286.0, 12)
+
+
+def test_rental_yield_is_null_but_counts_survive_when_a_side_is_thin():
+    repo = FakeAnalysisRepository(sale_psf_rows=[sale_psf_row(psf=2000.0, sales=1)])
+    rentals = FakeRentalRepository(yields=[rental_yield_row(rent_psf=5.0, rentals=20)])
+    out = PrivateResidentialService(repo, rentals).rental_yields(["PEER A"], 1000)
+
+    assert out["PEER A"]["gross_yield_pct"] is None
+    assert out["PEER A"]["sales"] == 1 and out["PEER A"]["rentals"] == 20
+
+
+def test_rental_yield_is_null_when_the_project_has_no_rentals():
+    repo = FakeAnalysisRepository(sale_psf_rows=[sale_psf_row()])
+    out = PrivateResidentialService(repo, FakeRentalRepository(yields=[])).rental_yields(
+        ["PEER A"], 1000
+    )
+    assert out == {}
+
+
+def test_rental_yield_is_skipped_without_a_rental_repository():
+    repo = FakeAnalysisRepository(sale_psf_rows=[sale_psf_row()])
+    assert PrivateResidentialService(repo).rental_yields(["PEER A"], 1000) == {}
+    assert repo.calls == []
+
+
+def test_rental_yield_is_skipped_without_projects():
+    repo = FakeAnalysisRepository()
+    rentals = FakeRentalRepository()
+    assert PrivateResidentialService(repo, rentals).rental_yields([], 1000) == {}
+    assert (repo.calls, rentals.calls) == ([], [])
+
+
 # --- live ClickHouse (skipped when unavailable) -------------------------------------------------
 
 
@@ -685,7 +1117,9 @@ def live_service():
     accessor = ClickHouseAccessor()
     if not accessor.ping():
         pytest.skip("ClickHouse not reachable")
-    service = PrivateResidentialService(PrivateResidentialRepository(accessor))
+    service = PrivateResidentialService(
+        PrivateResidentialRepository(accessor), PrivateRentalRepository(accessor)
+    )
     if service.coverage()["transactions"] == 0:
         pytest.skip("private_residential_transactions is empty")
     return service
@@ -711,6 +1145,18 @@ def test_live_transaction_filters(live_service):
 def test_live_coverage(live_service):
     coverage = live_service.coverage()
     assert coverage["transactions"] > 0 and coverage["first_month"] <= coverage["last_month"]
+
+
+def test_live_dataset_info_reports_the_rental_release(live_service):
+    out = live_service.dataset_info()
+    rental = out["rental"]
+    if rental is None:
+        pytest.skip("private_residential_rentals is empty")
+
+    assert rental["leases"] > 0 and rental["projects"] > 0
+    assert rental["first_month"] <= rental["last_month"]
+    assert 0 < rental["sale_projects_with_rentals"] <= rental["sale_projects"]
+    assert 0 <= rental["sale_projects_with_rentals_pct"] <= 100
 
 
 def test_live_price_trend(live_service):
@@ -804,6 +1250,25 @@ def test_live_estimate_value_for_a_project_without_coordinates(live_service):
         assert out["estimate"]["psf"] > 0 and out["unit"]["type_of_sale"] == "New Sale"
 
 
+def test_live_estimate_value_adds_a_rental_yield_and_income_cross_check(live_service):
+    out = live_service.estimate_value(
+        ValuationQuery.from_inputs("duchess residences", 1905, floor=3)
+    )
+    rental = out["rental"]
+    if rental is None:
+        pytest.skip("private_residential_rentals is empty or has no leases in this band")
+
+    assert (rental["band_low_sqft"], rental["band_high_sqft"]) == (1524, 2286)
+    assert rental["rentals"] >= 3 and rental["sales"] >= 2
+    assert 1.5 <= rental["gross_yield_pct"] <= 3.5
+    assert rental["annual_rent"] == pytest.approx(rental["rent_psf_month"] * 12 * 1905, rel=0.01)
+    cross = out["income_cross_check"]
+    if cross is not None:
+        assert cross["peer_projects"] >= 3
+        assert 0.5 <= cross["peer_gross_yield_pct"] <= 8.0
+        assert cross["implied_value"] > 0
+
+
 def test_live_growth_scan_ranks_neighbours(live_service):
     out = live_service.rank_nearby_growth(
         GrowthQuery.from_inputs(
@@ -823,6 +1288,33 @@ def test_live_growth_scan_ranks_neighbours(live_service):
     assert all(p["distance_m"] <= 2000 for p in out["peers"])
 
 
+def test_live_growth_scan_with_rental_ranks_by_total_return(live_service):
+    out = live_service.rank_nearby_growth(
+        GrowthQuery.from_inputs(
+            "duchess residences",
+            radius_m=2000,
+            months=60,
+            min_area_sqft=1200,
+            max_area_sqft=2000,
+            include_rental=True,
+        )
+    )
+    if out["rental"] is None:
+        pytest.skip("private_residential_rentals is empty")
+
+    assert out["ranking_basis"] == "total_return_pct"
+    assert out["rental"]["reference_area_sqft"] == 1600
+    assert (out["rental"]["band_low_sqft"], out["rental"]["band_high_sqft"]) == (1280, 1920)
+    ranked = [p for p in out["peers"] if p["total_return_pct"] is not None]
+    assert ranked and ranked == out["peers"][: len(ranked)]
+    assert ranked == sorted(ranked, key=lambda p: p["total_return_pct"], reverse=True)
+    for peer in ranked:
+        assert 0.0 <= peer["gross_yield_pct"] <= 8.0
+        assert peer["total_return_pct"] == pytest.approx(
+            peer["gross_yield_pct"] + peer["annual_growth_pct"], abs=0.06
+        )
+
+
 def test_live_affordability_search_finds_sales_inside_the_budget(live_service):
     query = AffordabilityQuery.from_inputs(1_500_000, district=15, min_area_sqft=600, limit=10)
     out = live_service.affordability_search(query)
@@ -831,3 +1323,21 @@ def test_live_affordability_search_finds_sales_inside_the_budget(live_service):
     prices = [p["median_price"] for p in out["projects"]]
     assert prices == sorted(prices, reverse=True)
     assert all(p["min_area_sqft"] >= 600 for p in out["projects"])
+
+
+def test_live_rental_yields_are_sane_for_two_known_projects(live_service):
+    out = live_service.rental_yields(["DUCHESS RESIDENCES", "D'LEEDON"], 1905)
+    if not out:
+        pytest.skip("private_residential_rentals is empty")
+
+    duchess = out.get("DUCHESS RESIDENCES")
+    assert duchess is not None and duchess["rent_psf_month"]
+    # A 999-year District 10 project: a low teens-to-high-twos gross yield is all that is
+    # plausible, so a wild number means the two tables were paired wrongly.
+    assert 1.5 <= duchess["gross_yield_pct"] <= 3.5
+    expected = 12 * duchess["rent_psf_month"] / duchess["sale_psf"] * 100
+    assert duchess["gross_yield_pct"] == pytest.approx(expected, abs=0.01)
+
+    leedon = out.get("D'LEEDON")
+    assert leedon is not None and leedon["rentals"] >= 10
+    assert 2.0 <= leedon["gross_yield_pct"] <= 4.5

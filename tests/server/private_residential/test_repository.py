@@ -281,6 +281,19 @@ def test_growth_project_name_stays_in_parameters():
     assert "DROP" not in sql and params["project"] == "X'; DROP TABLE T; --"
 
 
+def test_rental_overlap_uses_the_trusted_rental_table_and_no_parameters():
+    accessor = FakeAccessor([{"with_rentals": 2_753}])
+    row = PrivateResidentialRepository(accessor).rental_project_overlap(
+        "db.private_residential_rentals"
+    )
+    sql, params = accessor.calls[0]
+
+    assert row["with_rentals"] == 2_753
+    assert "FROM db.private_residential_transactions" in sql
+    assert "SELECT project FROM db.private_residential_rentals" in sql
+    assert "$" not in sql and params is None
+
+
 def test_affordable_projects_applies_filters_and_group_having():
     accessor = FakeAccessor([])
     query = AffordabilityQuery.from_inputs(

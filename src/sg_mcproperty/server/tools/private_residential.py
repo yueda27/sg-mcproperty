@@ -3,8 +3,9 @@
 Signatures and docstrings here are the schema the LLM sees. No SQL and no business rules:
 validation, limits and queries live in `sg_mcproperty.server.private_residential`.
 
-Tools that need information the caller did not supply use `server.elicitation.ask`, which
-works on both MCP protocol eras. Those tools are typed `Result | InputRequiredResult`.
+Tools that ask the user mid-call use `server.elicitation.ask`, which works on both MCP
+protocol eras; `supports_elicitation` says whether the client can be asked at all. Those
+tools are typed `Result | InputRequiredResult`.
 
 Planned tool: rank_projects.
 """
@@ -16,7 +17,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import InputRequiredResult
 
-from sg_mcproperty.server.elicitation import ask
+from sg_mcproperty.server.elicitation import ask, supports_elicitation
 from sg_mcproperty.server.private_residential import (
     AffordabilityQuery,
     AffordabilityResult,
@@ -106,6 +107,7 @@ def _growth_scope_form(
     max_area_sqft: float | None,
     min_transactions: int,
     tenure: str,
+    include_rental: bool,
 ):
     """Scan scope, pre-filled with whatever the caller already passed."""
     tenures = ("any", "freehold", "999 years", "freehold or 999 years")
@@ -139,6 +141,20 @@ def _growth_scope_form(
                 field(
                     default=min_transactions,
                     metadata={"description": "Resales a project needs before it is ranked"},
+                ),
+            ),
+            (
+                "include_rental",
+                bool,
+                field(
+                    default=include_rental,
+                    metadata={
+                        "title": "Count rental income?",
+                        "description": (
+                            "Rank by total return (gross rental yield plus growth) instead of "
+                            "price growth alone"
+                        ),
+                    },
                 ),
             ),
         ],
@@ -372,6 +388,10 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         comparison of recorded prices, not a formal valuation: it ignores floor, view, unit
         condition and project age. Always show the user the peers and the notes.
 
+        When `area_sqft` is given and rentals are loaded, it also adds a gross rental yield for
+        the project and each peer, measured on units within 20% of that area. Yields are gross:
+        they exclude stamp duty, agent fees, property tax, maintenance, vacancy and income tax.
+
         Args:
             project: Exact project name, case-insensitive.
             radius_m: Search radius in metres, 100-3000 (default 1000).
@@ -400,9 +420,11 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         peer_group (pooled stats across the returned peers, plus projects count),
         premium_pct (project median psf versus peer median psf, positive means the project is
         pricier), indicative_value (low/mid/high SGD from the peer 25th, 50th and 75th
-        percentile psf, only when area_sqft is given), window_start, window_end, and notes
-        with warnings such as small samples or tenure mismatches. Any value can be null when
-        there is no data.
+        percentile psf, only when area_sqft is given), rental (the reference area, +/-20% band,
+        12-month rent window and peers_with_yield; null without area_sqft or rentals),
+        window_start, window_end, and notes with warnings such as small samples or tenure
+        mismatches. When a yield is available, target and peers also carry gross_yield_pct.
+        Any value can be null when there is no data.
         """
         if ask_basis:
             form = _comparison_basis_form(type_of_sale, same_tenure_type, lease_year_tolerance)
@@ -446,7 +468,7 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         min_transactions: int = 4,
         segment: str = "non-landed",
         tenure: str = "any",
-        ask_scope: bool = False,
+        include_rental: bool = False,
     ) -> NearbyGrowth | InputRequiredResult:
         """Rank the nearest projects by psf growth, to find neighbours that grew faster.
 
@@ -455,6 +477,16 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         window, using only Resale and Sub Sale units. Use it for "which projects near X have
         grown faster?" and then compare_nearby or estimate_value on the winners. Growth is a
         recorded-price trend, not a forecast.
+
+        It always asks the user to confirm the scan before it runs: distance, number of
+        projects, window, tenure, unit-size band and whether rental income should count.
+        Declining keeps the arguments passed here and runs anyway. Set `include_rental` when
+        the user wants return rather than price growth alone: it adds a gross rental yield to
+        each project and ranks by total return (yield plus realised growth). Yields are
+        measured on units within 20% of the caller's size band, or of the anchor project's
+        median sale area when no band is given; the band actually used is returned in
+        size_band and rental. A client that cannot show the form gets the scan with the
+        arguments as given.
 
         Args:
             project: Exact project name, case-insensitive.
@@ -469,8 +501,8 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
             segment: Property group: "non-landed" (default), "ec", "landed" or
                 "strata-landed". Do not mix landed and non-landed psf.
             tenure: "any" (default), "freehold", "999 years" or "freehold or 999 years".
-            ask_scope: Set true when the user has not fixed the radius, peer count, window,
-                tenure or size band. The tool asks first; declining keeps the arguments above.
+            include_rental: Add gross rental yield and rank by total return (yield plus
+                realised annual growth) instead of growth alone. Default false.
 
         Returns: target (the project's own stats and annual_growth_pct), peers (nearest
         projects; ranked ones first, highest growth first, then the rest by distance), each
@@ -479,9 +511,12 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         projects_compared (peers with a usable trend), insufficient_data (peers returned
         without one) and notes. annual_growth_pct is the annualised psf trend, fitted by
         regressing log psf on time: 4.5 means +4.5% a year. It is null when a project has
-        fewer than 3 resales in the band.
+        fewer than 3 resales in the band. When include_rental is true, target and peers also
+        carry gross_yield_pct and total_return_pct, ranking_basis is "total_return_pct", and
+        rental describes the reference area, +/-20% band, 12-month rent window and how many
+        peers had a usable yield; better_than_target then compares total return.
         """
-        if ask_scope:
+        if supports_elicitation(ctx):
             form = _growth_scope_form(
                 radius_m,
                 max_peers,
@@ -490,12 +525,13 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
                 max_area_sqft,
                 min_transactions,
                 tenure,
+                include_rental,
             )
             answer = await ask(
                 ctx,
                 "growth_scope",
                 "Confirm the growth scan before it runs: distance, number of projects, window, "
-                "tenure and unit-size band.",
+                "tenure, unit-size band and whether rental income should count.",
                 form,
             )
             if answer.pending is not None:
@@ -509,6 +545,7 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
                 min_area_sqft = scope.min_area_sqft or None
                 max_area_sqft = scope.max_area_sqft or None
                 min_transactions = scope.min_transactions
+                include_rental = scope.include_rental
 
         query = GrowthQuery.from_inputs(
             project,
@@ -520,6 +557,7 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
             max_area_sqft,
             segment,
             tenure,
+            include_rental=include_rental,
         )
         return service.rank_nearby_growth(query)
 
@@ -619,7 +657,10 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         types_of_sale ("New Sale", "Sub Sale", "Resale"), segments (each with its segment name,
         the property types it groups and its transaction count; the segment names are the valid
         `segment` values for other tools), coordinate_coverage (percent of projects and of
-        transactions that have a location; compare_nearby needs one) and notes.
+        transactions that have a location; compare_nearby needs one), rental (leases, projects,
+        first_month and last_month of the separate rental contracts, sale_projects,
+        sale_projects_with_rentals and the percentage of sale projects that have rentals; null
+        when rentals are not loaded) and notes.
         """
         return service.dataset_info()
 
@@ -728,6 +769,13 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         notes, and the comparable_check. For context call market_activity (is the market
         liquid and which way is it moving) and compare_nearby (how the project compares).
 
+        When rental contracts are loaded it also reports a gross rental yield and an income
+        cross-check. Both are measured on units within 20% of `area_sqft`, because rent psf
+        falls with unit size: the yield is 12 months of rent over 24 months of resale prices,
+        and the cross-check capitalises this unit's rent at the median yield of the nearby
+        projects. Yields are gross: they exclude stamp duty, agent fees, property tax,
+        maintenance, vacancy and income tax.
+
         Args:
             project: Exact project name, case-insensitive.
             area_sqft: Size of the unit in square feet. Sales from half to double this size
@@ -751,10 +799,18 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         project's price level versus similar projects; null where not estimable), comparable_check
         (the median psf of the project's own sales within 20% of the size, or of nearby sales if
         the project has too few, and the value it implies, as a sanity check on the regression;
-        source says which), activity (sales in the sample over the last 3 complete months versus
-        the 3 before, as a liquidity and momentum signal), peers (the projects
-        used) and notes (warnings: small sample, weak fit, extrapolation, no project-specific
-        effect). Large gaps between estimate and comparable_check mean the estimate is shaky.
+        source says which), rental (gross rental yield on units within 20% of the size:
+        reference_area_sqft, band_low_sqft and band_high_sqft, the 12-month rent window,
+        rentals and sales counts, median_monthly_rent, rent_psf_month, annual_rent, sale_psf and
+        gross_yield_pct; null when the project has no leases in the band or rentals are not
+        loaded), income_cross_check (annual rent capitalised at the median gross yield of nearby
+        projects, with peer_gross_yield_pct, peer_projects, implied_value and divergence_pct
+        versus the regression estimate; null with fewer than 3 usable peers), activity (sales in
+        the sample over the last 3 complete months versus the 3 before, as a liquidity and
+        momentum signal), peers (the projects used) and notes (warnings: small sample, weak fit,
+        extrapolation, no project-specific effect, thin rental data). Large gaps between estimate
+        and comparable_check, or between estimate and income_cross_check, mean the estimate is
+        shaky.
         """
         if area_sqft is None:
             answer = await ask(

@@ -393,6 +393,7 @@ class GrowthQuery:
     max_area_sqft: float | None = None
     segment: str = "non-landed"
     tenure: str = "any"
+    include_rental: bool = False
 
     @classmethod
     def from_inputs(
@@ -406,6 +407,7 @@ class GrowthQuery:
         max_area_sqft: float | None = None,
         segment: str = "non-landed",
         tenure: str = "any",
+        include_rental: bool = False,
     ) -> "GrowthQuery":
         if not _squash(project):
             raise ValueError("project is required")
@@ -438,6 +440,7 @@ class GrowthQuery:
             max_area_sqft,
             segment_name,
             tenure_key,
+            bool(include_rental),
         )
 
 

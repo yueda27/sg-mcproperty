@@ -174,14 +174,14 @@ What it exposes for private residential data:
 | Kind | Name | Purpose |
 |---|---|---|
 | Tool | `search_projects` | Find exact project names from a fuzzy or misspelled name, optionally by district |
-| Tool | `dataset_info` | What the data covers: counts, date range, valid districts, sale types and segments, and coordinate coverage. Call it to learn valid filter values and data freshness |
+| Tool | `dataset_info` | What the data covers: counts, date range, valid districts, sale types and segments, coordinate coverage, and the rental contracts' coverage and overlap with projects. Call it to learn valid filter values and data freshness |
 | Tool | `project_summary` | One project's profile: tenure, sales mix, price, psf and area ranges, and the latest 12 months versus the 12 before |
 | Tool | `market_activity` | Sales per month, quarter or year split by sale type, with the volume change over complete periods. A liquidity and momentum check before trusting a price |
-| Tool | `estimate_value` | Regression estimate of what a unit would sell for, with a range (see below) |
+| Tool | `estimate_value` | Regression estimate of what a unit would sell for, with a range, plus a gross rental yield and income cross-check for the size (see below) |
 | Tool | `search_transactions` | List transactions, newest first, filtered by project, district, segment, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
 | Tool | `price_trend` | Median price and psf per month, quarter or year, for a project, district or the market. Flags thin periods and reports the psf change |
-| Tool | `compare_nearby` | Compares one project's psf with similar projects nearby to value it (see below) |
-| Tool | `rank_nearby_growth` | Ranks the nearest projects by annualised psf growth, using resales in the same window and size band. Finds neighbours that grew faster than the project |
+| Tool | `compare_nearby` | Compares one project's psf with similar projects nearby to value it, adding size-matched rental yields when `area_sqft` is given (see below) |
+| Tool | `rank_nearby_growth` | Ranks the nearest projects by annualised psf growth, using resales in the same window and size band; always confirms the scan scope first, and with `include_rental` ranks by gross total return instead |
 | Tool | `affordability_search` | Projects with sales inside a budget, dearest median price first. Asks for a budget or works one out from income and loan assumptions (see below) |
 | Prompt | `project_overview` | Guides the model through summarising one project's recent sales, liquidity and price trend |
 | Prompt | `recent_deals` | Guides the model through ranking notable sales in a district, respecting the row cap |
@@ -202,6 +202,13 @@ python -m sg_mcproperty.server.dev_client call compare_nearby "project=treasure 
 - **Result:** the project's median psf, each peer's distance and psf, the pooled peer median and
   quartiles, `premium_pct` (project versus peer median) and, when `area_sqft` is given, an
   indicative price range from the peer 25th to 75th percentile psf.
+- **Rental yield** (`rental`, and `gross_yield_pct` on the project and each peer) appears only when
+  `area_sqft` is given, because a yield is only comparable between similar-sized units. It uses
+  rents and Resale/Sub Sale prices inside +/-20% of that area, so the target and peers are measured
+  on the same size band. Yields are gross: they ignore stamp duty, agent fees, property tax,
+  maintenance, vacancy and income tax. `rental.peers_with_yield` says how many peers had enough
+  data; the notes say why a yield is missing. With a `New Sale` comparison, yields still use resale
+  prices (and the notes say so).
 - **Age matters a lot.** Older projects price lower, so by default the notes warn when peers' lease
   start is more than 15 years from the project's. `lease_year_tolerance=8` limits peers to similar
   age (for Treasure at Tampines the premium over peers falls from about 58% to 3%).
@@ -231,6 +238,14 @@ trend), a sanity check against the project's own median psf, and notes.
   project's own level. With fewer sales ("area" mode) the model compares across projects and the
   estimate reflects the surrounding area. The lease and freehold effects are only estimated in
   area mode, where they can be confounded with project quality.
+- **Rental yield and income check.** Rentals are not a regression feature: the estimate stays a
+  price model. Instead, when rentals are loaded, the result adds a `rental` block with the gross
+  yield for units within +/-20% of `area_sqft` (12-month rent median over 24-month Resale/Sub Sale
+  psf), and an `income_cross_check` that capitalises the unit's rent at the median yield of the
+  comparable peer projects and compares that implied value with the regression estimate. The check
+  is only offered with at least 3 peer projects and a plausible yield (0.5-8%), and a divergence of
+  more than 20% is flagged. All yields are gross: they exclude stamp duty, agent fees, property
+  tax, maintenance, vacancy and income tax.
 - **Accuracy**, from `scripts/backtest_estimate.py` (fit on older sales, predict held-out later
   ones, 25 busy projects, four hold-out periods, about 1,200 held-out sales): the median absolute
   error was 3.4-4.1% and the 90th percentile 9-14%. The plain 80% interval was too narrow
@@ -259,6 +274,13 @@ python -m sg_mcproperty.server.dev_client call rank_nearby_growth "project=duche
 - `annual_growth_pct` is a recorded-price trend, not a forecast: 4.5 means +4.5% a year. Projects
   with fewer than `min_transactions` resales (default 4) or fewer than 3 usable sales are returned
   after the ranked peers with no growth figure, so the coverage is visible.
+- **Total return:** pass `include_rental=true` to rank by `total_return_pct` instead, which adds
+  each project's gross rental yield, measured on units within +/-20% of the same reference area, to
+  its realised annual growth. Without a size band, the reference area is the project's median sale
+  area and the growth scan narrows to that band. If rentals are not loaded or no yield is usable,
+  the ranking falls back to growth only and says so in `ranking_basis` and the notes. Total return
+  mixes a current yield with a past growth rate: it is "what this asset returned lately", never a
+  forecast, and it is before costs.
 - Projects without coordinates cannot be scanned; use `compare_nearby` for those.
 
 ### Searching by budget (`affordability_search`)
@@ -276,12 +298,15 @@ python -m sg_mcproperty.server.dev_client call affordability_search max_price=15
 
 ### Elicitation
 
-`estimate_value` (no size), `compare_nearby` (`ask_basis=true`), `rank_nearby_growth`
-(`ask_scope=true`) and `affordability_search` (no budget) ask for missing input mid-call. The
+`estimate_value` (no size), `compare_nearby` (`ask_basis=true`), `rank_nearby_growth` (always,
+including whether to count rental yield) and `affordability_search` (no budget) ask for input
+mid-call. The
 helper in `server/elicitation.py` supports both protocol eras: handshake connections use
 `ctx.elicit`, while the 2026-07-28 protocol returns an `InputRequiredResult` and the client retries
 the call with the answers. Declining a form falls back to the arguments already passed, except for
-`estimate_value` and `affordability_search`, where there is nothing to answer without it.
+`estimate_value` and `affordability_search`, where there is nothing to answer without it. A
+handshake-era client that did not declare elicitation cannot be asked: `rank_nearby_growth` then
+runs with the arguments as given.
 
 ### Trying the tools without an MCP client
 
@@ -304,6 +329,7 @@ server/tools | prompts | resources   MCP adapters: signatures, docstrings, one c
 server/private_residential/service.py      validation, limits, typed results
         v
 server/private_residential/repository.py   SQL templates and parameters
+server/private_rental/repository.py        same, for the rental contracts table
         v
 accessor.py (ClickHouseAccessor)           read-only ClickHouse connection
 ```
@@ -311,6 +337,11 @@ accessor.py (ClickHouseAccessor)           read-only ClickHouse connection
 `server/private_residential/filters.py` holds the pure input handling (normalising names,
 validating districts and dates, building the `WHERE` clause). `server/app.py` wires the layers
 together. SQL values always go through `{name:Type}` parameters, never string formatting.
+
+The service also composes `server/private_rental/`, which owns the rental contracts table and
+the pure yield maths in `returns.py`. Both repositories sit at the same layer; the service is
+the only place that combines their rows, and `rental_repository` is optional so the server runs
+without the rentals table loaded.
 
 ## 8. Cursor / VS Code launch configurations
 
@@ -336,7 +367,8 @@ uv run ruff check . && uv run ruff format .
 ```
 
 `tests/server/private_residential/` mirrors the source (`test_filters.py`, `test_repository.py`,
-`test_service.py`, `test_regression.py`). The service tests use a fake repository and the repository tests use a fake
+`test_service.py`, `test_regression.py`), and `tests/server/private_rental/` covers the rental
+repository and the yield maths. The service tests use a fake repository and the repository tests use a fake
 accessor, so most tests need no database. A few tests run against live ClickHouse and skip
 themselves when it is not running or the table is empty.
 
@@ -359,6 +391,7 @@ loader does not exist in this repo.
 | `src/sg_mcproperty/accessor.py` | `ClickHouseAccessor`: read-only parameterised queries |
 | `src/sg_mcproperty/server/app.py` | MCP server entry point and wiring (`sg-property-mcp`) |
 | `src/sg_mcproperty/server/private_residential/` | `filters.py`, `repository.py`, `service.py` for the dataset |
+| `src/sg_mcproperty/server/private_rental/` | Rental contracts `repository.py` and the pure yield maths (`returns.py`) |
 | `src/sg_mcproperty/server/{tools,prompts,resources}/` | MCP adapters, one module per dataset |
 | `src/sg_mcproperty/server/dev_client.py` | Terminal client for trying tools during development |
 | `scripts/backtest_estimate.py` | Backtests `estimate_value` on held-out sales (accuracy and interval coverage) |
@@ -376,7 +409,8 @@ loader does not exist in this repo.
    `rank_projects`
 4. ~~Keep URA `propertyType` and the coordinates~~ done. `typeOfArea` and `marketSegment` are still
    dropped. Fill in coordinates for projects URA leaves blank (for example by geocoding the street)
-5. ~~Add URA rental contracts~~ table and loader done. Still to do: a rental yield tool and a way to
+5. ~~Add URA rental contracts~~ table and loader done, and `estimate_value`, `compare_nearby`,
+   `rank_nearby_growth` and `dataset_info` now use them for gross yields. Still to do: a way to
    estimate bedrooms per sale from the rental bands (`bedrooms` by project and area band). The rental
    coordinates do not help the sales gap: only 48 of the 150 sale projects with no coordinates are in
    the rentals with coordinates, covering 84 of about 27,800 affected sales

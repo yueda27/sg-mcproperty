@@ -230,6 +230,7 @@ def project_growth_row(growth=0.039, transactions=12, **overrides):
         "transactions": transactions,
         "median_psf": 2100.0,
         "median_price": 2_100_000.0,
+        "median_area_sqft": 1_000.0,
         "annual_growth": growth,
     }
     return {**row, **overrides}
@@ -270,6 +271,9 @@ class FakeAnalysisRepository:
         growth_peers=(),
         growth_target=None,
         affordable=(),
+        sale_psf_rows=(),
+        rental_overlap=1,
+        coverage=None,
     ):
         self.trend = list(trend)
         self.profile = profile
@@ -286,6 +290,9 @@ class FakeAnalysisRepository:
         self.growth_peers = list(growth_peers)
         self.growth_target = growth_target or project_growth_row()
         self.affordable = list(affordable)
+        self.sale_psf_rows = list(sale_psf_rows)
+        self.rental_overlap = rental_overlap
+        self._coverage = coverage
         self.calls = []
 
     def price_trend(self, filters, period_fn):
@@ -297,12 +304,16 @@ class FakeAnalysisRepository:
         return self.profile
 
     def coverage(self):
-        return {
+        return self._coverage or {
             "transactions": 1,
             "projects": 1,
             "first_month": datetime(2021, 11, 1),
             "last_month": datetime(2026, 11, 1),
         }
+
+    def rental_project_overlap(self, rental_table):
+        self.calls.append(("rental_project_overlap", rental_table))
+        return {"with_rentals": self.rental_overlap}
 
     def find_peers_by_distance(self, project, x, y, radius_m, filters, min_transactions, limit):
         self.calls.append(("distance", x, y, radius_m, filters, limit))
@@ -349,3 +360,50 @@ class FakeAnalysisRepository:
     def affordable_projects(self, query):
         self.calls.append(("affordable_projects", query))
         return self.affordable
+
+    def sale_psf(self, projects, area_low, area_high, start_date):
+        self.calls.append(("sale_psf", list(projects), area_low, area_high, start_date))
+        return self.sale_psf_rows
+
+
+class FakeRentalRepository:
+    """Rental repository stand-in: canned yield rows, records the calls made."""
+
+    def __init__(self, yields=(), coverage=None):
+        self.yields = list(yields)
+        self._coverage = coverage
+        self.calls = []
+
+    def yield_for_projects(self, projects, area_low, area_high, months):
+        self.calls.append(("yield_for_projects", list(projects), area_low, area_high, months))
+        return self.yields
+
+    def coverage(self):
+        return self._coverage or {
+            "rentals": 1,
+            "projects": 1,
+            "first_month": datetime(2021, 11, 1),
+            "last_month": datetime(2026, 10, 1),
+        }
+
+    def latest_month(self):
+        self.calls.append(("latest_month",))
+        return self.coverage()["last_month"]
+
+    @property
+    def table_name(self):
+        return "db.private_residential_rentals"
+
+
+def rental_yield_row(project="PEER A", rentals=20, rent_psf=5.0, rent=9000.0, **overrides):
+    row = {
+        "project": project,
+        "rentals": rentals,
+        "median_monthly_rent": rent,
+        "rent_psf_month": rent_psf,
+    }
+    return {**row, **overrides}
+
+
+def sale_psf_row(project="PEER A", sales=10, psf=2000.0):
+    return {"project": project, "sales": sales, "median_psf": psf}

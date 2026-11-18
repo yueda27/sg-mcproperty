@@ -15,7 +15,13 @@ from typing import Any, Literal
 
 from fastmcp import Context
 from fastmcp.server.elicitation import get_elicitation_schema
-from mcp.types import ElicitRequest, ElicitRequestFormParams, InputRequiredResult
+from mcp.types import (
+    ClientCapabilities,
+    ElicitationCapability,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    InputRequiredResult,
+)
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 Action = Literal["accept", "decline", "cancel", "pending"]
@@ -48,6 +54,22 @@ async def ask[T](ctx: Context, key: str, message: str, response_type: type[T]) -
     if result.action != "accept":
         return Answer(result.action)
     return Answer("accept", value=result.data)
+
+
+def supports_elicitation(ctx: Context) -> bool:
+    """Whether this call can ask the user.
+
+    The 2026-07-28 era carries the question in an `InputRequiredResult`, which is part of the
+    protocol, so there is nothing to check. Handshake-era elicitation needs the client to have
+    declared the capability; asking without it raises, so callers must check first.
+    """
+    if _is_modern(ctx):
+        return True
+    context = ctx.request_context
+    session = context.session if context is not None else None
+    if session is None:
+        return False
+    return session.check_client_capability(ClientCapabilities(elicitation=ElicitationCapability()))
 
 
 def _is_modern(ctx: Context) -> bool:

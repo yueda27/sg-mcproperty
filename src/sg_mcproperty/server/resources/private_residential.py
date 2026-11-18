@@ -43,6 +43,26 @@ Caveats:
 - There is no bedroom count in the data.
 - About 5% of projects, but 22% of transactions, have no coordinates. These are mostly recent
   new launches, so "nearby" comparisons fall back to the same street, then the same district.
+
+## Rental contracts
+
+A separate URA release, one row per contract, with the same project names as the sales table:
+
+| Column | Meaning |
+|---|---|
+| project, street, district | As in the sales table |
+| property_type | URA rental wording, e.g. "Non-landed Properties" |
+| lease_date | First day of the month the lease started (URA gives month and year only) |
+| area_sqft_min, area_sqft_max | URA gives a 100-sqft band; max is null for the open-top ">3000" band |
+| bedrooms | URA bedroom count, null when not reported |
+| rent | Monthly rent in SGD |
+| x, y | Project location in SVY21 metres |
+
+Yields compare rents with Resale and Sub Sale prices inside the same +/-20% size band, because
+rent psf falls with unit size. They are gross: `12 * rent psf / sale psf`, before stamp duty,
+agent fees, property tax, maintenance, vacancy and income tax. The rent median covers the latest
+12 months; the sale psf covers the latest 24. For the open-top area band, rent psf is an upper
+bound because the area divisor is the band's lower edge.
 """
 
 

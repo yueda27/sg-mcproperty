@@ -7,12 +7,17 @@ Layers (each only calls the one below; one `private_residential/` package per da
 `src/sg_mcproperty/server/private_residential/` (`filters.py`, `repository.py`, `service.py`,
 plus pure computation modules such as `regression.py`)):
 
+`private_rental/` is not a dataset of its own: it holds the rental contracts repository and the
+pure yield maths (`returns.py`), which the private residential service composes with its own
+repository to put a rental yield beside a valuation. Keep the two repositories at the same layer
+and combine their rows only in the service.
+
 | Layer | Lives in | Owns |
 |---|---|---|
 | MCP adapters | `server/tools`, `server/prompts`, `server/resources` | signatures, docstrings, one-line calls into the service. No SQL, no rules |
-| Service | `private_residential/` package | validation, limits, result shaping |
-| Repository | `private_residential/` package | SQL templates and parameters |
-| Pure computation | `private_residential/regression.py` | model fitting and prediction: no I/O, no SQL, no MCP; called by the service |
+| Service | `private_residential/` package | validation, limits, result shaping, composing repositories |
+| Repository | `private_residential/`, `private_rental/` | SQL templates and parameters, one table each |
+| Pure computation | `private_residential/regression.py`, `private_rental/returns.py` | fitting, prediction, yield and return maths: no I/O, no SQL, no MCP |
 | Accessor | `accessor.py` | the ClickHouse connection |
 
 - Read-only: the accessor defaults to `readonly=True`. Parameterise SQL with `{name:Type}`;

@@ -121,6 +121,8 @@ def _value_estimate(query):
         "model": None,
         "effects": None,
         "comparable_check": None,
+        "rental": None,
+        "income_cross_check": None,
         "activity": {
             "sales_in_sample": 0,
             "last_3_months": 0,
@@ -152,6 +154,7 @@ def _nearby(query):
         "peer_group": None,
         "premium_pct": None,
         "indicative_value": None,
+        "rental": None,
         "notes": [],
     }
 
@@ -182,6 +185,8 @@ def _growth(query):
         "peers": [],
         "projects_compared": 0,
         "insufficient_data": 0,
+        "ranking_basis": "annual_growth_pct",
+        "rental": None,
         "notes": [],
     }
 
@@ -243,6 +248,7 @@ SCOPE_FORM = frozenset(
         "min_area_sqft",
         "max_area_sqft",
         "min_transactions",
+        "include_rental",
     }
 )
 PROFILE_FORM = frozenset(
@@ -345,15 +351,79 @@ def test_growth_scan_asks_for_its_scope(mode):
             "min_area_sqft": 1200,
             "max_area_sqft": 2000,
             "min_transactions": 5,
+            "include_rental": True,
         },
     }
-    _call(service, mode, payloads, "rank_nearby_growth", {"project": "aurea", "ask_scope": True})
+    _call(
+        service,
+        mode,
+        payloads,
+        "rank_nearby_growth",
+        {"project": "aurea", "radius_m": 1000},
+    )
 
     _, query = service.calls[0]
     assert (query.radius_m, query.max_peers, query.months) == (2500, 40, 36)
     assert query.tenure == "freehold or 999 years"
     assert (query.min_area_sqft, query.max_area_sqft) == (1200, 2000)
     assert query.min_transactions == 5
+    assert query.include_rental is True
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_growth_scan_rental_question_keeps_the_passed_answer_by_default(mode):
+    service = StubService()
+    payloads = {
+        SCOPE_FORM: {
+            "radius_m": 2000,
+            "max_peers": 50,
+            "months": 60,
+            "tenure": "any",
+            "min_area_sqft": 0,
+            "max_area_sqft": 0,
+            "min_transactions": 4,
+        },
+    }
+    _call(
+        service,
+        mode,
+        payloads,
+        "rank_nearby_growth",
+        {"project": "aurea", "include_rental": True},
+    )
+
+    _, query = service.calls[0]
+    assert query.include_rental is True
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_growth_scan_cancelling_keeps_the_arguments(mode):
+    service = StubService()
+
+    async def run():
+        async with Client(build_server(service), mode=mode, elicitation_handler=_cancel) as client:
+            return await client.call_tool(
+                "rank_nearby_growth", {"project": "aurea", "radius_m": 1500, "months": 36}
+            )
+
+    _run(run())
+    _, query = service.calls[0]
+    assert (query.radius_m, query.months) == (1500, 36)
+
+
+def test_growth_scan_runs_with_the_arguments_when_the_client_cannot_be_asked():
+    # Handshake-era clients that never declared elicitation would raise if asked.
+    service = StubService()
+
+    async def run():
+        async with Client(build_server(service), mode="legacy") as client:
+            return await client.call_tool(
+                "rank_nearby_growth", {"project": "aurea", "radius_m": 1500, "months": 36}
+            )
+
+    _run(run())
+    _, query = service.calls[0]
+    assert (query.radius_m, query.months) == (1500, 36)
 
 
 @pytest.mark.parametrize("mode", MODES)

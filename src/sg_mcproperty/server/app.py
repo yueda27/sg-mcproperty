@@ -7,6 +7,7 @@ Each of `tools/`, `prompts/` and `resources/` exposes `register(mcp, ...)` per d
 from fastmcp import FastMCP
 
 from sg_mcproperty.accessor import ClickHouseAccessor
+from sg_mcproperty.server.private_rental import PrivateRentalRepository
 from sg_mcproperty.server.private_residential import (
     PrivateResidentialRepository,
     PrivateResidentialService,
@@ -19,7 +20,8 @@ from sg_mcproperty.server.tools import private_residential as private_residentia
 def build_server(service: PrivateResidentialService | None = None) -> FastMCP:
     """Build the MCP server. Pass a service to use something other than the live database."""
     service = service or PrivateResidentialService(
-        PrivateResidentialRepository(ClickHouseAccessor())
+        PrivateResidentialRepository(ClickHouseAccessor()),
+        PrivateRentalRepository(ClickHouseAccessor()),
     )
     mcp = FastMCP(
         "sg-property",
