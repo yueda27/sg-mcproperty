@@ -3,6 +3,7 @@
     python -m sg_mcproperty.server.dev_client list
     python -m sg_mcproperty.server.dev_client call search_projects name_query=parktown district=18
     python -m sg_mcproperty.server.dev_client call search_projects '{"name_query": "parktown"}'
+    python -m sg_mcproperty.server.dev_client read property://private-residential/coverage
 
 Transports:
     memory (default): the server runs inside this process, so breakpoints in tool code are hit
@@ -80,10 +81,24 @@ async def call_tool(client: Client, name: str, arguments: dict[str, Any]) -> Non
     print(json.dumps(data, indent=2, default=str))
 
 
+async def read_resource(client: Client, uri: str) -> None:
+    for content in await client.read_resource(uri):
+        text = getattr(content, "text", None)
+        if text is None:
+            print(content)
+            continue
+        try:  # pretty print JSON resources, show anything else (markdown) as is
+            print(json.dumps(json.loads(text), indent=2))
+        except json.JSONDecodeError:
+            print(text)
+
+
 async def run(args: argparse.Namespace) -> None:
     async with make_client(args.transport, args.server_logs) as client:
         if args.command == "list":
             await list_tools(client)
+        elif args.command == "read":
+            await read_resource(client, args.uri)
         else:
             await call_tool(client, args.tool, parse_arguments(args.arguments))
 
@@ -96,6 +111,8 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="list tools with descriptions and input schemas")
+    read = sub.add_parser("read", help="read one resource by URI")
+    read.add_argument("uri", help="e.g. property://private-residential/coverage")
     call = sub.add_parser("call", help="call one tool")
     call.add_argument("tool")
     call.add_argument("arguments", nargs="*", help="key=value pairs, or one JSON object")

@@ -15,6 +15,8 @@ PROJECTS = [
     {
         "project": "THE TEST",
         "street": "TEST ROAD",
+        "x": "27107.4972",
+        "y": "32559.5",
         "transaction": [
             {
                 "area": "100",
@@ -24,6 +26,7 @@ PROJECTS = [
                 "price": "1500000",
                 "district": "09",
                 "tenure": "99 yrs lease commencing from 2010",
+                "propertyType": "Condominium",
             },
             {
                 "area": "200",
@@ -33,7 +36,26 @@ PROJECTS = [
                 "price": "3000000",
                 "district": "15",
                 "tenure": "Freehold",
+                "propertyType": "Terrace House",
             },
+        ],
+    },
+    {
+        "project": "NO COORDS",
+        "street": "Y",
+        "x": "",
+        "y": None,
+        "transaction": [
+            {
+                "area": "50",
+                "floorRange": "01-05",
+                "contractDate": "0124",
+                "typeOfSale": "2",
+                "price": "1",
+                "district": "01",
+                "tenure": "Freehold",
+                "propertyType": "Apartment",
+            }
         ],
     },
     {"project": "EMPTY", "street": "X", "transaction": []},
@@ -42,8 +64,8 @@ PROJECTS = [
 
 def test_flatten_one_row_per_transaction():
     df = flatten(PROJECTS)
-    assert df.height == 2
-    assert df["project"].to_list() == ["THE TEST", "THE TEST"]
+    assert df.height == 3
+    assert df["project"].to_list() == ["THE TEST", "THE TEST", "NO COORDS"]
 
 
 def test_flatten_empty():
@@ -67,6 +89,10 @@ def test_transform():
     assert b["lease_year"] is None
     assert b["floor"] is None
     assert b["contract_date"] == datetime(2023, 12, 1)
+    assert (a["property_type"], b["property_type"]) == ("Condominium", "Terrace House")
+    assert (a["x"], a["y"]) == (27107.4972, 32559.5)
+    c = out.row(2, named=True)
+    assert c["x"] is None and c["y"] is None  # empty or missing coordinates become null
 
 
 def test_transform_empty():

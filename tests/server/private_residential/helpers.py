@@ -76,3 +76,153 @@ def transaction_row(**overrides):
         "lease_year": 2024,
     }
     return {**row, **overrides}
+
+
+def stats_row(
+    transactions=10, projects=1, p25=1800.0, median=2000.0, p75=2200.0, price=2_000_000.0
+):
+    return {
+        "transactions": transactions,
+        "projects": projects,
+        "p25_psf": p25,
+        "median_psf": median,
+        "p75_psf": p75,
+        "median_price": price,
+    }
+
+
+def profile_row(**overrides):
+    row = {
+        "project": "TARGET",
+        "street": "MAIN ROAD",
+        "district": 15,
+        "property_type": "Condominium",
+        "tenure": "99 years",
+        "lease_year": 2018,
+        "transactions": 100,
+        "x": 30000.0,
+        "y": 33000.0,
+    }
+    return {**row, **overrides}
+
+
+def peer_row(project="PEER A", distance_m=500, **overrides):
+    row = {
+        "project": project,
+        "street": "OTHER ROAD",
+        "district": 15,
+        "property_type": "Condominium",
+        "tenure": "99 years",
+        "lease_year": 2016,
+        "transactions": 20,
+        "median_psf": 1900.0,
+        "median_price": 1_900_000.0,
+        "distance_m": distance_m,
+    }
+    return {**row, **overrides}
+
+
+def facets_row(**overrides):
+    row = {
+        "districts": [1, 2, 3],
+        "types_of_sale": ["New Sale", "Resale", "Sub Sale"],
+        "projects_with_coordinates_pct": 95.0,
+        "transactions_with_coordinates_pct": 80.0,
+    }
+    return {**row, **overrides}
+
+
+def summary_row(**overrides):
+    row = {
+        "transactions": 75,
+        "first_sale": datetime(2025, 3, 1),
+        "last_sale": datetime(2026, 11, 1),
+        "new_sales": 70,
+        "sub_sales": 1,
+        "resales": 4,
+        "min_price": 1_700_000.0,
+        "median_price": 2_000_000.0,
+        "max_price": 12_000_000.0,
+        "p25_psf": 2700.0,
+        "median_psf": 2900.0,
+        "p75_psf": 3000.0,
+        "min_area_sqft": 600.0,
+        "median_area_sqft": 700.0,
+        "max_area_sqft": 3000.0,
+        "recent_transactions": 30,
+        "recent_median_psf": 3000.0,
+        "prior_transactions": 40,
+        "prior_median_psf": 2900.0,
+    }
+    return {**row, **overrides}
+
+
+class FakeAnalysisRepository:
+    """Repository stand-in for price_trend and compare_nearby. Records the calls made."""
+
+    def __init__(
+        self,
+        trend=(),
+        profile=None,
+        distance_peers=(),
+        street_peers=(),
+        district_peers=(),
+        target=None,
+        pooled=None,
+        facets=None,
+        type_counts=(),
+        summary=None,
+    ):
+        self.trend = list(trend)
+        self.profile = profile
+        self.distance_peers = list(distance_peers)
+        self.street_peers = list(street_peers)
+        self.district_peers = list(district_peers)
+        self.target = target or stats_row(transactions=30, median=2400.0)
+        self.pooled = pooled or stats_row(transactions=60, projects=3)
+        self.facets = facets or facets_row()
+        self.type_counts = list(type_counts)
+        self.summary = summary or summary_row()
+        self.calls = []
+
+    def price_trend(self, filters, period_fn):
+        self.calls.append(("price_trend", filters, period_fn))
+        return self.trend
+
+    def project_profile(self, project):
+        self.calls.append(("project_profile", project))
+        return self.profile
+
+    def coverage(self):
+        return {
+            "transactions": 1,
+            "projects": 1,
+            "first_month": datetime(2021, 11, 1),
+            "last_month": datetime(2026, 11, 1),
+        }
+
+    def find_peers_by_distance(self, project, x, y, radius_m, filters, min_transactions, limit):
+        self.calls.append(("distance", x, y, radius_m, filters, limit))
+        return self.distance_peers
+
+    def find_peers_by_area(self, project, scope, value, filters, min_transactions, limit):
+        self.calls.append((scope, value, filters, limit))
+        return self.street_peers if scope == "street" else self.district_peers
+
+    def project_stats(self, project, filters):
+        self.calls.append(("project_stats", project, filters))
+        return self.target
+
+    def pooled_stats(self, projects, filters):
+        self.calls.append(("pooled_stats", projects, filters))
+        return self.pooled
+
+    def dataset_facets(self):
+        return self.facets
+
+    def property_type_counts(self):
+        return self.type_counts
+
+    def project_summary(self, project, recent_start, prior_start):
+        self.calls.append(("project_summary", project, recent_start, prior_start))
+        return self.summary

@@ -2,8 +2,16 @@ from datetime import date
 
 import pytest
 
-from sg_mcproperty.server.private_residential import TransactionFilters
-from sg_mcproperty.server.private_residential.filters import normalise_project_query
+from sg_mcproperty.server.private_residential import NearbyQuery, TransactionFilters
+from sg_mcproperty.server.private_residential.filters import (
+    PeerFilters,
+    add_months,
+    normalise_project_name,
+    normalise_project_query,
+    resolve_segment,
+    segment_of,
+    validate_period,
+)
 
 
 def test_normalise_project_query():
@@ -71,3 +79,103 @@ def test_user_input_never_reaches_sql_text():
 def test_invalid_filters_rejected(kwargs):
     with pytest.raises(ValueError):
         TransactionFilters.from_inputs(**kwargs)
+
+
+# --- segments, periods, dates -------------------------------------------------------------------
+
+
+def test_resolve_segment():
+    assert resolve_segment(None) is None
+    assert resolve_segment("ALL") is None
+    assert resolve_segment(" Non-Landed ") == "non-landed"
+    assert resolve_segment("auto") == "non-landed"  # market-wide questions
+    assert resolve_segment("auto", project="AUREA") is None  # a named project decides itself
+    with pytest.raises(ValueError):
+        resolve_segment("houses")
+
+
+def test_segment_of_groups_comparable_types_and_isolates_unknown():
+    assert segment_of("Apartment") == segment_of("Condominium")
+    assert segment_of("Condominium")[0] == "non-landed"
+    assert segment_of("Strata Terrace")[0] == "strata-landed"
+    assert segment_of("Terrace")[0] == "landed"
+    assert segment_of("Houseboat") == ("Houseboat", ("Houseboat",))
+
+
+def test_segment_filter_becomes_a_parameter():
+    filters = TransactionFilters.from_inputs(segment="landed")
+    where, params = filters.to_sql()
+    assert "property_type IN {property_types:Array(String)}" in where
+    assert params["property_types"] == ["Terrace", "Semi-detached", "Detached"]
+    assert filters.segment == "landed"
+
+
+def test_price_trend_default_segment_depends_on_project():
+    assert TransactionFilters.from_inputs(segment="auto").segment == "non-landed"
+    assert TransactionFilters.from_inputs(project="aurea", segment="auto").segment is None
+
+
+def test_validate_period():
+    assert validate_period(" Quarter ") == "quarter"
+    with pytest.raises(ValueError):
+        validate_period("week")
+
+
+def test_add_months_crosses_years_both_ways():
+    assert add_months(date(2026, 11, 1), -11) == date(2025, 12, 1)
+    assert add_months(date(2026, 1, 1), -1) == date(2025, 12, 1)
+    assert add_months(date(2025, 12, 1), 2) == date(2026, 2, 1)
+
+
+# --- peer filters and nearby query --------------------------------------------------------------
+
+
+def test_peer_filters_only_emit_what_is_set():
+    base = PeerFilters(property_types=("Condominium",), start_date=date(2025, 12, 1))
+    sql, params = base.to_sql()
+    assert sql.count("AND") == 2 and "tenure" not in sql
+    assert params == {"property_types": ["Condominium"], "start_date": "2025-12-01"}
+
+    full = PeerFilters(
+        ("Condominium",), date(2025, 12, 1), "Resale", 800.0, 1200.0, True, 2010, 2020
+    )
+    sql, params = full.to_sql()
+    assert "(tenure = 'Freehold') = {freehold:UInt8}" in sql
+    assert params["freehold"] == 1 and params["min_lease_year"] == 2010
+    assert "$" not in sql
+
+
+def test_nearby_query_normalises_and_computes_size_band():
+    query = NearbyQuery.from_inputs(
+        " treasure  at tampines ", type_of_sale="resale", area_sqft=1000
+    )
+    assert query.project == "TREASURE AT TAMPINES" and query.type_of_sale == "Resale"
+    assert query.size_band() == (800.0, 1200.0)
+    assert NearbyQuery.from_inputs("x1").size_band() == (None, None)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"project": " "},
+        {"radius_m": 50},
+        {"radius_m": 5000},
+        {"months": 0},
+        {"months": 61},
+        {"max_peers": 0},
+        {"max_peers": 21},
+        {"area_sqft": 0},
+        {"type_of_sale": "Lease"},
+        {"lease_year_tolerance": -1},
+        {"lease_year_tolerance": 61},
+    ],
+)
+def test_nearby_query_rejects_bad_inputs(kwargs):
+    with pytest.raises(ValueError):
+        NearbyQuery.from_inputs(**{"project": "AUREA", **kwargs})
+
+
+def test_normalise_project_name():
+    assert normalise_project_name("  parktown   residence ") == "PARKTOWN RESIDENCE"
+    with pytest.raises(ValueError):
+        normalise_project_name("   ")

@@ -9,8 +9,9 @@ URA API --(sg-property-load --dump)--> output/*.parquet --(to_clickhouse)--> Cli
 ```
 
 Status: private residential transactions are fetched, transformed, dumped to parquet and
-loaded into ClickHouse. The MCP server has two tools (`search_projects`, `search_transactions`),
-two prompts and two resources for that dataset. More tools are planned (see [TODO](#todo)).
+loaded into ClickHouse. The MCP server has six tools (`search_projects`, `search_transactions`,
+`price_trend`, `compare_nearby`, `dataset_info`, `project_summary`), three prompts and two resources for that dataset. More tools are
+planned (see [TODO](#todo)).
 
 ## 1. Prerequisites
 
@@ -67,7 +68,9 @@ uv run sg-property-migrate        # creates the database and applies pending mig
 
 ### The table
 
-`0001_private_residential_transactions.sql` creates `sg_property.private_residential_transactions`:
+`0001_private_residential_transactions.sql` creates `sg_property.private_residential_transactions`, and
+`0002_private_residential_location_and_type.sql` adds `property_type`, `x` and `y` (re-run the load
+after migrating so they are filled in):
 
 | Column | Type | Notes |
 |---|---|---|
@@ -80,6 +83,8 @@ uv run sg-property-migrate        # creates the database and applies pending mig
 | `district` | `UInt8` | |
 | `tenure` | `LowCardinality(String)` | `99 years`, `999 years`, `Freehold`, ... |
 | `lease_year` | `Nullable(UInt16)` | lease commencement year, null for freehold |
+| `property_type` | `LowCardinality(String)` | URA type: Apartment, Condominium, Executive Condominium, Terrace, Semi-detached, Detached and the Strata variants |
+| `x`, `y` | `Nullable(Float64)` | project location in SVY21 metres. Null for about 5% of projects but about 22% of transactions, mostly recent new launches |
 | `loaded_at` | `DateTime` | default `now()` |
 
 It is a plain `MergeTree` ordered by `(district, project, contract_date)` and partitioned by year.
@@ -135,11 +140,39 @@ What it exposes for private residential data:
 | Kind | Name | Purpose |
 |---|---|---|
 | Tool | `search_projects` | Find exact project names from a fuzzy or misspelled name, optionally by district |
-| Tool | `search_transactions` | List transactions, newest first, filtered by project, district, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
+| Tool | `dataset_info` | What the data covers: counts, date range, valid districts, sale types and segments, and coordinate coverage. Call it to learn valid filter values and data freshness |
+| Tool | `project_summary` | One project's profile: tenure, sales mix, price, psf and area ranges, and the latest 12 months versus the 12 before |
+| Tool | `search_transactions` | List transactions, newest first, filtered by project, district, segment, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
+| Tool | `price_trend` | Median price and psf per month, quarter or year, for a project, district or the market. Flags thin periods and reports the psf change |
+| Tool | `compare_nearby` | Compares one project's psf with similar projects nearby to value it (see below) |
 | Prompt | `project_overview` | Guides the model through summarising one project's recent sales |
 | Prompt | `recent_deals` | Guides the model through listing notable sales in a district |
+| Prompt | `value_project` | Guides the model through a full "is this project priced high or low?" assessment |
 | Resource | `property://private-residential/schema` | Column meanings, units and caveats |
 | Resource | `property://private-residential/coverage` | Live row count, project count and date range |
+
+### Valuing a project against nearby ones (`compare_nearby`)
+
+```bash
+python -m sg_mcproperty.server.dev_client call compare_nearby "project=treasure at tampines" radius_m=2000 months=24 area_sqft=1000 lease_year_tolerance=8
+```
+
+- **Peers** are projects of the same segment within `radius_m` metres (SVY21 distance), nearest first.
+  Segments keep like with like: non-landed (condos and apartments), `ec`, `landed` and `strata-landed`.
+- **Same conditions for both sides:** the project and its peers use the same window (`months`
+  ending at the latest data month), sale type and size band (+/-20% of `area_sqft`).
+- **Result:** the project's median psf, each peer's distance and psf, the pooled peer median and
+  quartiles, `premium_pct` (project versus peer median) and, when `area_sqft` is given, an
+  indicative price range from the peer 25th to 75th percentile psf.
+- **Age matters a lot.** Older projects price lower, so by default the notes warn when peers' lease
+  start is more than 15 years from the project's. `lease_year_tolerance=8` limits peers to similar
+  age (for Treasure at Tampines the premium over peers falls from about 58% to 3%).
+  `same_tenure_type=true` restricts to freehold or leasehold like the project.
+- **Missing coordinates:** about a fifth of transactions (22%), mostly new launches, belong to projects
+  without coordinates. For those the peers are the busiest projects on the same street, then in
+  the same district (`basis` says which, and `distance_m` is null).
+- It is an indicative comparison of recorded prices, not a valuation: it ignores floor, view and
+  unit condition.
 
 ### Trying the tools without an MCP client
 
@@ -225,9 +258,10 @@ loader does not exist in this repo.
 
 1. ~~Setup loading script~~ done for private residential. HDB resale loader still to do
 2. ~~Setup tables~~ done for private residential
-3. ~~Setup MCP tools~~ `search_projects` and `search_transactions` done. Still planned:
-   `dataset_info`, `price_trend`, `project_summary`, `compare`, `rank_projects`,
-   `market_activity`, `find_comparables`, `affordability_search`
-4. Keep URA `propertyType`, `typeOfArea` and `marketSegment` in `flatten` (landed versus condo)
+3. ~~Setup MCP tools~~ `search_projects`, `search_transactions`, `price_trend` and `compare_nearby`
+   `dataset_info` and `project_summary` done. Still planned: `rank_projects`, `market_activity`,
+   `affordability_search`
+4. ~~Keep URA `propertyType` and the coordinates~~ done. `typeOfArea` and `marketSegment` are still
+   dropped. Fill in coordinates for projects URA leaves blank (for example by geocoding the street)
 5. Add URA rental contracts (`noOfBedRoom`) to estimate bedrooms per transaction
 6. Optional `--load` flag on `sg-property-load` to dump and insert in one command

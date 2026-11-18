@@ -18,6 +18,9 @@ COLUMNS = [
     "district",
     "tenure",
     "lease_year",
+    "property_type",
+    "x",
+    "y",
 ]
 
 
@@ -31,8 +34,10 @@ TXN_FIELDS = (
     "price",
     "district",
     "tenure",
+    "propertyType",
 )
-RAW_FIELDS = ("project", "street", *TXN_FIELDS)
+# `x` and `y` (SVY21 metres) live on the project, like `street`.
+RAW_FIELDS = ("project", "street", "x", "y", *TXN_FIELDS)
 
 
 def flatten(projects: list[dict[str, Any]]) -> pl.DataFrame:
@@ -45,6 +50,8 @@ def flatten(projects: list[dict[str, Any]]) -> pl.DataFrame:
         {
             "project": project.get("project"),
             "street": project.get("street"),
+            "x": project.get("x"),
+            "y": project.get("y"),
             **{f: txn.get(f) for f in TXN_FIELDS},
         }
         for project in projects
@@ -112,6 +119,9 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
       date for Resale and Sub Sale records.
     - type_of_sale: URA code 1/2/3 -> "New Sale" / "Sub Sale" / "Resale"; null if the
       code is unknown.
+    - property_type: URA `propertyType`, e.g. "Condominium" or "Terrace House".
+    - x, y: project location in SVY21 metres (distances between projects can use plain
+      Euclidean distance). Null when URA has no usable coordinate.
     - tenure / lease_year: "99 yrs lease commencing from 2024" -> tenure "99 years" and
       lease_year 2024. Freehold has no lease year (null) and keeps its tenure text.
     """
@@ -134,6 +144,9 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("tenure")
         .map_elements(extract_lease_year, return_dtype=pl.Int64)
         .alias("lease_year"),
+        pl.col("propertyType").str.strip_chars().alias("property_type"),
+        pl.col("x").cast(pl.Float64, strict=False),
+        pl.col("y").cast(pl.Float64, strict=False),
     )
 
 

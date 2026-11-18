@@ -52,8 +52,15 @@ def test_tools_prompts_and_resources_are_registered():
             return tools, prompts, resources
 
     tools, prompts, resources = _run(inspect())
-    assert tools == {"search_projects", "search_transactions"}
-    assert prompts == {"project_overview", "recent_deals"}
+    assert tools == {
+        "search_projects",
+        "search_transactions",
+        "price_trend",
+        "compare_nearby",
+        "dataset_info",
+        "project_summary",
+    }
+    assert prompts == {"project_overview", "recent_deals", "value_project"}
     assert resources == {
         "property://private-residential/schema",
         "property://private-residential/coverage",

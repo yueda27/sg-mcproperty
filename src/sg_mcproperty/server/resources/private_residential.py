@@ -28,11 +28,21 @@ Source: URA private residential transactions, last 5 years. One row per transact
 | floor | Midpoint of the URA floor range (06-10 becomes 8). Null for landed property |
 | tenure | Length of tenure, e.g. "99 years", "999 years", or "Freehold" |
 | lease_year | Lease commencement year. Null for freehold |
+| property_type | URA type: Apartment, Condominium, Executive Condominium, Terrace, Semi-detached, Detached and the Strata variants of the three landed types |
+| x, y | Project location in SVY21 metres (distance between projects is Euclidean). Null for many projects |
+
+Segments group property types so psf is comparable inside a group:
+- non-landed: Apartment, Condominium
+- ec: Executive Condominium
+- landed: Terrace, Semi-detached, Detached (psf is on land area)
+- strata-landed: Strata Terrace, Strata Semi-detached, Strata Detached (psf is on floor area)
 
 Caveats:
 - URA gives month precision only, so there is no sale day.
 - Landed property has no floor and its psf is not comparable with condos.
 - There is no bedroom count in the data.
+- About 5% of projects, but 22% of transactions, have no coordinates. These are mostly recent
+  new launches, so "nearby" comparisons fall back to the same street, then the same district.
 """
 
 

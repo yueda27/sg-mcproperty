@@ -4,21 +4,30 @@ Each layer only calls the one below it. The MCP adapters in `server/tools`, `ser
 and `server/resources` depend on the service only.
 """
 
-from .filters import TransactionFilters
+from .filters import NearbyQuery, TransactionFilters
 from .repository import PrivateResidentialRepository
 from .service import (
     Coverage,
+    DatasetInfo,
+    NearbyComparison,
+    PriceTrend,
     PrivateResidentialService,
     ProjectMatch,
+    ProjectSummary,
     Transaction,
     TransactionPage,
 )
 
 __all__ = [
     "Coverage",
+    "DatasetInfo",
+    "NearbyComparison",
+    "NearbyQuery",
+    "PriceTrend",
     "PrivateResidentialRepository",
     "PrivateResidentialService",
     "ProjectMatch",
+    "ProjectSummary",
     "Transaction",
     "TransactionFilters",
     "TransactionPage",
