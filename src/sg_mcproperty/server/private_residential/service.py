@@ -5,10 +5,13 @@ SQL or MCP.
 """
 
 import math
+import re
 from dataclasses import replace
 from datetime import date, datetime
+from statistics import median
 from typing import Any, TypedDict
 
+from . import regression
 from .filters import (
     AGE_GAP_NOTE_YEARS,
     PERIODS,
@@ -16,9 +19,11 @@ from .filters import (
     NearbyQuery,
     PeerFilters,
     TransactionFilters,
+    ValuationQuery,
     add_months,
     normalise_project_name,
     normalise_project_query,
+    period_start,
     segment_of,
     validate_district,
     validate_period,
@@ -30,6 +35,24 @@ MAX_TRANSACTION_RESULTS = 100
 LOW_SAMPLE = 5  # fewer transactions than this is flagged as a thin sample
 MIN_PEER_TRANSACTIONS = 3  # a peer project needs this many matching sales to count
 SUMMARY_WINDOW_MONTHS = 12  # project_summary compares the latest 12 months with the 12 before
+
+# estimate_value
+MAX_SAMPLE_ROWS = 20_000
+MIN_OBSERVATIONS = 30  # fewer comparable sales than this and no model is fitted
+SMALL_SAMPLE = 60
+WEAK_R_SQUARED = 0.5
+HIGH_ERROR_PCT = 10.0
+MIN_TARGET_SALES = 5  # own sales needed to value at the project's own price level
+SAMPLE_AREA_RANGE = (0.5, 2.0)  # compare units from half to double the requested size
+FLOOR_SEGMENTS = ("non-landed", "ec")  # landed property has no floor
+LEASE_CAP_YEARS = 99
+LONG_LEASE_YEARS = 900  # tenures this long behave like freehold
+WIDE_INTERVAL_RATIO = 1.5
+COMPARABLE_AREA_BAND = 0.2
+
+# market_activity: periods compared (recent vs the same number before) and months per period
+ACTIVITY_WINDOW = {"month": 3, "quarter": 2, "year": 1}
+PERIOD_MONTHS = {"month": 1, "quarter": 3, "year": 12}
 
 
 class ProjectMatch(TypedDict):
@@ -207,6 +230,96 @@ class ProjectSummary(TypedDict):
     notes: list[str]
 
 
+class ValuationUnit(TypedDict):
+    area_sqft: float
+    floor: int | None
+    type_of_sale: str
+    remaining_lease_years: float | None
+    freehold: bool
+
+
+class ValueBand(TypedDict):
+    median: int
+    low: int
+    high: int
+    interval_pct: int
+    psf: float
+
+
+class ModelStats(TypedDict):
+    mode: str
+    sales_used: int
+    projects: int
+    r_squared: float
+    typical_error_pct: float
+    outliers_removed: int
+    features: list[str]
+
+
+class ValueEffects(TypedDict):
+    size_plus_10pct_area_pct: float | None
+    per_10_floors_pct: float | None
+    per_10_years_lease_pct: float | None
+    freehold_premium_pct: float | None
+    new_sale_premium_pct: float | None
+    monthly_trend_pct: float | None
+    target_project_premium_pct: float | None
+
+
+class ComparableCheck(TypedDict):
+    source: str
+    sales_used: int
+    median_psf: float | None
+    implied_value: int | None
+
+
+class ActivitySnapshot(TypedDict):
+    sales_in_sample: int
+    last_3_months: int
+    prior_3_months: int
+    volume_change_pct: float | None
+
+
+class ValueEstimate(TypedDict):
+    project: str
+    segment: str
+    basis: str
+    radius_m: int | None
+    window_start: str
+    window_end: str
+    unit: ValuationUnit
+    estimate: ValueBand | None
+    model: ModelStats | None
+    effects: ValueEffects | None
+    comparable_check: ComparableCheck | None
+    activity: ActivitySnapshot
+    peers: list[PeerProject]
+    notes: list[str]
+
+
+class ActivityPoint(TypedDict):
+    period: str
+    transactions: int
+    new_sales: int
+    sub_sales: int
+    resales: int
+    median_price: float | None
+    median_psf: float | None
+
+
+class MarketActivity(TypedDict):
+    period: str
+    segment: str | None
+    points: list[ActivityPoint]
+    total_transactions: int
+    average_per_period: float | None
+    recent_periods: int
+    recent_transactions: int
+    prior_transactions: int
+    volume_change_pct: float | None
+    notes: list[str]
+
+
 class Coverage(TypedDict):
     transactions: int
     projects: int
@@ -239,6 +352,49 @@ def _psf_stats(row: dict[str, Any]) -> PsfStats | None:
         "p75_psf": _num(row["p75_psf"]),
         "median_price": _num(row["median_price"]),
     }
+
+
+def _tenure_years(tenure: str) -> int | None:
+    match = re.match(r"\s*(\d+)\s*years?", tenure)
+    return int(match.group(1)) if match else None
+
+
+def _is_freehold(tenure: str) -> bool:
+    years = _tenure_years(tenure)
+    return tenure == "Freehold" or (years is not None and years >= LONG_LEASE_YEARS)
+
+
+def _remaining_lease(tenure: str, lease_year: int | None, year: int) -> float:
+    """Years of lease left in `year`, capped: freehold and unknown leases count as the cap."""
+    years = _tenure_years(tenure)
+    if _is_freehold(tenure) or years is None or lease_year is None:
+        return float(LEASE_CAP_YEARS)
+    return float(min(max(years - (year - lease_year), 0), LEASE_CAP_YEARS))
+
+
+def _pct(coefficient: float | None, scale: float = 1.0) -> float | None:
+    """A log-price coefficient as a percentage effect: exp(b * scale) - 1."""
+    return None if coefficient is None else round((math.exp(coefficient * scale) - 1) * 100, 1)
+
+
+def _sale_from_row(
+    row: dict[str, Any], target: str, start: date, use_floor: bool
+) -> regression.Sale | None:
+    if use_floor and row["floor"] is None:
+        return None
+    sold = row["contract_date"]
+    lease_year = _num(row["lease_year"])
+    return regression.Sale(
+        area_sqft=row["area_sqft"],
+        floor=row["floor"],
+        month_index=(sold.year - start.year) * 12 + (sold.month - start.month),
+        new_sale=row["type_of_sale"] == "New Sale",
+        freehold=_is_freehold(row["tenure"]),
+        remaining_lease=_remaining_lease(row["tenure"], lease_year, sold.year),
+        is_target=row["project"] == target,
+        price=row["price"],
+        project=row["project"],
+    )
 
 
 def _clamp(limit: int, maximum: int) -> int:
@@ -306,11 +462,7 @@ class PrivateResidentialService:
 
     def compare_nearby(self, query: NearbyQuery) -> NearbyComparison:
         repo = self._repository
-        profile = repo.project_profile(query.project)
-        if profile is None:
-            raise ValueError(
-                f"Unknown project {query.project!r}: use search_projects to find the exact name"
-            )
+        profile = self._require_profile(query.project)
         segment, property_types = segment_of(profile["property_type"])
         window_end = repo.coverage()["last_month"].date()
         low, high = query.size_band()
@@ -327,27 +479,9 @@ class PrivateResidentialService:
             max_lease_year=target_lease_year + tolerance if tolerance is not None else None,
         )
 
-        x, y = _num(profile["x"]), _num(profile["y"])
-        if x is not None and y is not None:
-            basis = "radius"
-            peer_rows = repo.find_peers_by_distance(
-                query.project, x, y, query.radius_m, peer_filters, MIN_PEER_TRANSACTIONS,
-                query.max_peers,
-            )  # fmt: skip
-        else:
-            # No coordinates (common for new launches): same street is the closest proxy,
-            # then the same district.
-            basis = "street"
-            peer_rows = repo.find_peers_by_area(
-                query.project, "street", profile["street"], peer_filters, MIN_PEER_TRANSACTIONS,
-                query.max_peers,
-            )  # fmt: skip
-            if not peer_rows:
-                basis = "district"
-                peer_rows = repo.find_peers_by_area(
-                    query.project, "district", profile["district"], peer_filters,
-                    MIN_PEER_TRANSACTIONS, query.max_peers,
-                )  # fmt: skip
+        basis, peer_rows = self._find_peers(
+            query.project, profile, query.radius_m, peer_filters, query.max_peers
+        )
 
         target_filters = replace(
             peer_filters, freehold=None, min_lease_year=None, max_lease_year=None
@@ -376,10 +510,7 @@ class PrivateResidentialService:
                 "high": round((peer_group["p75_psf"] or peer_group["median_psf"]) * area),
             }
 
-        peers: list[PeerProject] = [
-            {**{k: _num(v) for k, v in row.items()}, "distance_m": _num(row["distance_m"])}
-            for row in peer_rows
-        ]  # type: ignore[misc]
+        peers = self._peer_projects(peer_rows)
         notes = self._nearby_notes(query, profile, basis, target, peer_rows, peer_group)
         return {
             "project": query.project,
@@ -461,6 +592,337 @@ class PrivateResidentialService:
                     "(freehold vs leasehold): set same_tenure_type=true for a stricter match."
                 )
         return notes
+
+    def _require_profile(self, project: str) -> dict[str, Any]:
+        profile = self._repository.project_profile(project)
+        if profile is None:
+            raise ValueError(
+                f"Unknown project {project!r}: use search_projects to find the exact name"
+            )
+        return profile
+
+    def _find_peers(
+        self,
+        project: str,
+        profile: dict[str, Any],
+        radius_m: int,
+        peer_filters: PeerFilters,
+        max_peers: int,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Peer projects and how they were found: "radius", else "street", else "district"."""
+        repo = self._repository
+        x, y = _num(profile["x"]), _num(profile["y"])
+        if x is not None and y is not None:
+            peers = repo.find_peers_by_distance(
+                project, x, y, radius_m, peer_filters, MIN_PEER_TRANSACTIONS, max_peers
+            )
+            return "radius", peers
+        # No coordinates (common for new launches): same street is the closest proxy, then
+        # the same district.
+        peers = repo.find_peers_by_area(
+            project, "street", profile["street"], peer_filters, MIN_PEER_TRANSACTIONS, max_peers
+        )
+        if peers:
+            return "street", peers
+        peers = repo.find_peers_by_area(
+            project, "district", profile["district"], peer_filters, MIN_PEER_TRANSACTIONS, max_peers
+        )
+        return "district", peers
+
+    @staticmethod
+    def _peer_projects(peer_rows: list[dict[str, Any]]) -> list[PeerProject]:
+        return [
+            {**{k: _num(v) for k, v in row.items()}, "distance_m": _num(row["distance_m"])}
+            for row in peer_rows
+        ]  # type: ignore[misc]
+
+    def estimate_value(self, query: ValuationQuery) -> ValueEstimate:
+        repo = self._repository
+        profile = self._require_profile(query.project)
+        segment, property_types = segment_of(profile["property_type"])
+        window_end = repo.coverage()["last_month"].date()
+        start = add_months(window_end, -(query.months - 1))
+        filters = PeerFilters(
+            property_types=property_types,
+            start_date=start,
+            min_area_sqft=query.area_sqft * SAMPLE_AREA_RANGE[0],
+            max_area_sqft=query.area_sqft * SAMPLE_AREA_RANGE[1],
+        )
+        basis, peer_rows = self._find_peers(
+            query.project, profile, query.radius_m, filters, query.max_peers
+        )
+        rows = repo.valuation_sample(
+            [query.project, *(p["project"] for p in peer_rows)], filters, MAX_SAMPLE_ROWS
+        )
+        use_floor = segment in FLOOR_SEGMENTS
+        sales = [
+            sale
+            for row in rows
+            if (sale := _sale_from_row(row, query.project, start, use_floor)) is not None
+        ]
+
+        freehold = _is_freehold(profile["tenure"])
+        remaining = (
+            float(LEASE_CAP_YEARS)
+            if freehold
+            else _remaining_lease(profile["tenure"], _num(profile["lease_year"]), window_end.year)
+        )
+        own_floors = [s.floor for s in sales if s.is_target and s.floor is not None]
+        sample_floors = [s.floor for s in sales if s.floor is not None]
+        floor = query.floor
+        if use_floor and floor is None and (own_floors or sample_floors):
+            floor = round(median(own_floors or sample_floors))
+        sale_type = query.type_of_sale or "Resale"
+        unit = regression.Unit(
+            area_sqft=query.area_sqft,
+            floor=floor if use_floor else None,
+            month_index=query.months - 1,  # value at the latest month of data
+            new_sale=sale_type == "New Sale",
+            freehold=freehold,
+            remaining_lease=remaining,
+            is_target=True,
+        )
+
+        own_sales = sum(s.is_target for s in sales)
+        model = (
+            regression.fit(sales, use_floor, project_effects=own_sales >= MIN_TARGET_SALES)
+            if len(sales) >= MIN_OBSERVATIONS
+            else None
+        )
+        band = effects = model_stats = None
+        if model is not None:
+            log_price, se = regression.predict(model, unit, use_floor)
+            log_low, log_high = regression.interval(log_price, se)
+            low, mid, high = math.exp(log_low), math.exp(log_price), math.exp(log_high)
+            band = {
+                "median": round(mid, -3),
+                "low": round(low, -3),
+                "high": round(high, -3),
+                "interval_pct": 80,
+                "psf": round(mid / query.area_sqft),
+            }
+            coefficient = model.coefficient
+            effects = {
+                "size_plus_10pct_area_pct": _pct(coefficient("ln_area"), math.log(1.1)),
+                "per_10_floors_pct": _pct(coefficient("floor_10")),
+                "per_10_years_lease_pct": _pct(coefficient("lease_10")),
+                "freehold_premium_pct": _pct(coefficient("freehold")),
+                "new_sale_premium_pct": _pct(coefficient("new_sale")),
+                "monthly_trend_pct": _pct(coefficient("month")),
+                "target_project_premium_pct": self._project_premium(model, sales),
+            }
+            model_stats = {
+                "mode": model.mode,
+                "sales_used": model.observations,
+                "projects": len({row["project"] for row in rows}),
+                "r_squared": round(model.r_squared, 3),
+                "typical_error_pct": round((math.exp(model.residual_sd) - 1) * 100, 1),
+                "outliers_removed": model.outliers_removed,
+                "features": [n for n in model.names[1:] if not n.startswith("project:")]
+                + (["project_levels"] if model.mode == "project" else []),
+            }
+
+        in_band = [
+            s for s in sales if abs(s.area_sqft / query.area_sqft - 1) <= COMPARABLE_AREA_BAND
+        ]
+        own_in_band = [s for s in in_band if s.is_target]
+        source, pool = (
+            ("project", own_in_band) if len(own_in_band) >= LOW_SAMPLE else ("nearby", in_band)
+        )
+        check = None
+        if pool:
+            psf = median(s.price / s.area_sqft for s in pool)
+            check = {
+                "source": source,
+                "sales_used": len(pool),
+                "median_psf": round(psf),
+                "implied_value": round(psf * query.area_sqft, -3)
+                if len(pool) >= LOW_SAMPLE
+                else None,
+            }
+
+        # The latest month is probably incomplete, so use the complete months before it.
+        last = query.months - 1
+        recent = sum(last - 3 <= s.month_index < last for s in sales)
+        prior = sum(last - 6 <= s.month_index < last - 3 for s in sales)
+        activity: ActivitySnapshot = {
+            "sales_in_sample": len(sales),
+            "last_3_months": recent,
+            "prior_3_months": prior,
+            "volume_change_pct": round((recent / prior - 1) * 100, 1) if prior else None,
+        }
+
+        notes = self._valuation_notes(
+            query, basis, sale_type, sales, model, band, rows, unit, use_floor
+        )
+        return {
+            "project": query.project,
+            "segment": segment,
+            "basis": basis,
+            "radius_m": query.radius_m if basis == "radius" else None,
+            "window_start": start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "unit": {
+                "area_sqft": query.area_sqft,
+                "floor": unit.floor,
+                "type_of_sale": sale_type,
+                "remaining_lease_years": None if freehold else remaining,
+                "freehold": freehold,
+            },
+            "estimate": band,
+            "model": model_stats,
+            "effects": effects,
+            "comparable_check": check,
+            "activity": activity,
+            "peers": self._peer_projects(peer_rows),
+            "notes": notes,
+        }
+
+    @staticmethod
+    def _valuation_notes(
+        query: ValuationQuery,
+        basis: str,
+        sale_type: str,
+        sales: list[regression.Sale],
+        model: regression.Model | None,
+        band: ValueBand | None,
+        rows: list[dict[str, Any]],
+        unit: regression.Unit,
+        use_floor: bool,
+    ) -> list[str]:
+        notes = [
+            (
+                "Statistical estimate from recorded transaction prices, not a formal valuation: "
+                "it ignores view, facing, renovation and the exact unit."
+            )
+        ]
+        if query.type_of_sale is None:
+            notes.append(
+                'Valued as a resale unit. Pass type_of_sale="New Sale" for new-launch pricing.'
+            )
+        if basis != "radius":
+            notes.append(
+                f"This project has no coordinates in the data, so comparables come from the same "
+                f"{basis} rather than the nearest projects."
+            )
+        if model is None:
+            notes.append(
+                f"Only {len(sales)} comparable sales (at least {MIN_OBSERVATIONS} needed) so no "
+                "estimate was made: try a larger radius_m, more months or a different unit size."
+            )
+            return notes
+        if model.observations < SMALL_SAMPLE:
+            notes.append(f"Small sample ({model.observations} sales): treat the range with care.")
+        if model.r_squared < WEAK_R_SQUARED:
+            notes.append(
+                f"Weak fit (R-squared {model.r_squared:.2f}): prices vary a lot for reasons the "
+                "model does not capture."
+            )
+        if model.mode == "area":
+            own = sum(s.is_target for s in sales)
+            has = "no sales" if own == 0 else f"only {own} sales"
+            notes.append(
+                f"The project has {has} in the window (at least {MIN_TARGET_SALES} "
+                "needed), so the estimate reflects similar nearby projects, not this project's "
+                "own price level. The lease and freehold effects are compared across projects "
+                "and can be confounded with project quality: treat them as indicative."
+            )
+        areas = [s.area_sqft for s in sales]
+        if not min(areas) <= query.area_sqft <= max(areas):
+            notes.append("The requested size is outside the sizes sold: the estimate extrapolates.")
+        floors = [s.floor for s in sales if s.floor is not None]
+        if (
+            use_floor
+            and unit.floor is not None
+            and floors
+            and not min(floors) <= unit.floor <= max(floors)
+        ):
+            notes.append("The floor is outside the floors sold: the floor effect extrapolates.")
+        typical_error = (math.exp(model.residual_sd) - 1) * 100
+        if typical_error > HIGH_ERROR_PCT:
+            notes.append(
+                f"Prices in the sample vary by about {typical_error:.0f}% around the model: "
+                "the estimate is rough."
+            )
+        if band and band["high"] / band["low"] > WIDE_INTERVAL_RATIO:
+            notes.append("The range is wide: individual sales vary a lot around the estimate.")
+        if model.outliers_removed:
+            notes.append(f"{model.outliers_removed} unusual sales were excluded from the fit.")
+        if len(rows) >= MAX_SAMPLE_ROWS:
+            notes.append("The sample hit its size cap: only the most recent sales were used.")
+        return notes
+
+    @staticmethod
+    def _project_premium(model: regression.Model, sales: list[regression.Sale]) -> float | None:
+        """The target's price level versus its peers, in percent (project mode only).
+
+        Each peer's level is relative to the target, so the target's premium is the negative of
+        the sales-weighted average peer level.
+        """
+        levels = model.project_levels()
+        if not levels:
+            return None
+        counts = {p: sum(s.project == p for s in sales) for p in levels}
+        total = sum(counts.values())
+        average = sum(levels[p] * counts[p] for p in levels) / total
+        return _pct(-average)
+
+    def market_activity(self, filters: TransactionFilters, period: str = "month") -> MarketActivity:
+        key = validate_period(period)
+        repo = self._repository
+        rows = {_iso(row["period"]): row for row in repo.market_activity(filters, PERIODS[key])}
+        step = PERIOD_MONTHS[key]
+        last_period = period_start(repo.coverage()["last_month"].date(), key)
+
+        points: list[ActivityPoint] = []
+        if rows:
+            current = date.fromisoformat(min(rows))
+            while (
+                current <= last_period
+            ):  # fill gaps so recent and prior windows are calendar based
+                row = rows.get(current.isoformat())
+                points.append(
+                    {
+                        "period": current.isoformat(),
+                        "transactions": row["transactions"] if row else 0,
+                        "new_sales": row["new_sales"] if row else 0,
+                        "sub_sales": row["sub_sales"] if row else 0,
+                        "resales": row["resales"] if row else 0,
+                        "median_price": _num(row["median_price"]) if row else None,
+                        "median_psf": _num(row["median_psf"]) if row else None,
+                    }
+                )
+                current = add_months(current, step)
+
+        # The latest period is probably incomplete (URA publishes with a delay), so the recent
+        # and prior windows are the complete periods before it.
+        window = ACTIVITY_WINDOW[key]
+        complete = points[:-1]
+        recent = sum(p["transactions"] for p in complete[-window:])
+        prior = sum(p["transactions"] for p in complete[-2 * window : -window])
+        total = sum(p["transactions"] for p in points)
+        notes = []
+        if not points:
+            notes.append("No transactions match these filters.")
+        else:
+            notes.append(
+                f"The latest {key} ({points[-1]['period']}) may be incomplete, so it is left out of "
+                "recent_transactions, prior_transactions and volume_change_pct."
+            )
+        if filters.segment is None and filters.project is None:
+            notes.append("No segment filter: landed and non-landed sales are counted together.")
+        return {
+            "period": key,
+            "segment": filters.segment,
+            "points": points,
+            "total_transactions": total,
+            "average_per_period": round(total / len(points), 1) if points else None,
+            "recent_periods": window,
+            "recent_transactions": recent,
+            "prior_transactions": prior,
+            "volume_change_pct": round((recent / prior - 1) * 100, 1) if prior else None,
+            "notes": notes,
+        }
 
     def dataset_info(self) -> DatasetInfo:
         repo = self._repository

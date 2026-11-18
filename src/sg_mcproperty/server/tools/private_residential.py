@@ -3,13 +3,14 @@
 Signatures and docstrings here are the schema the LLM sees. No SQL and no business rules:
 validation, limits and queries live in `sg_mcproperty.server.private_residential`.
 
-Planned tools: rank_projects, market_activity, affordability_search.
+Planned tools: rank_projects, affordability_search.
 """
 
 from fastmcp import FastMCP
 
 from sg_mcproperty.server.private_residential import (
     DatasetInfo,
+    MarketActivity,
     NearbyComparison,
     NearbyQuery,
     PriceTrend,
@@ -18,6 +19,8 @@ from sg_mcproperty.server.private_residential import (
     ProjectSummary,
     TransactionFilters,
     TransactionPage,
+    ValuationQuery,
+    ValueEstimate,
 )
 
 
@@ -189,7 +192,7 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
                 it and adds indicative_value (peer psf x this area).
             same_tenure_type: If true, peers must match the project's freehold or leasehold
                 status.
-            max_peers: Maximum number of peer projects, 1-20 (default 10, nearest first).
+            max_peers: Maximum number of peer projects, 1-50 (default 10, nearest first).
             lease_year_tolerance: Only compare with leasehold projects whose lease started
                 within this many years of the project's (0-60), e.g. 10. Age is a big driver
                 of psf, so use it when peers are much older or newer. Ignored for freehold
@@ -261,3 +264,114 @@ def register(mcp: FastMCP, service: PrivateResidentialService) -> None:
         be null when there is no data.
         """
         return service.project_summary(project)
+
+    @mcp.tool
+    def market_activity(
+        project: str | None = None,
+        district: int | None = None,
+        segment: str = "auto",
+        type_of_sale: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        period: str = "month",
+    ) -> MarketActivity:
+        """How many private residential sales happen over time, split by sale type.
+
+        Use it to judge liquidity and momentum before trusting a price: a project or area
+        with few sales gives a shaky median, and a falling or rising sales volume says how the
+        market is moving. Call it before or alongside estimate_value, price_trend and
+        compare_nearby. Filters are optional and combined with AND. Use search_projects first
+        to get an exact project name.
+
+        Args:
+            project: Exact project name, case-insensitive, e.g. "PARKTOWN RESIDENCE".
+            district: Postal district, 1-28.
+            segment: "auto" (default: non-landed for market-wide questions, no filter when a
+                project is named), "non-landed", "ec", "landed", "strata-landed" or "all".
+            type_of_sale: Optionally count only "New Sale", "Sub Sale" or "Resale".
+            start_date: Earliest month, inclusive, "YYYY-MM" or "YYYY-MM-DD".
+            end_date: Latest month, inclusive, same format.
+            period: "month" (default), "quarter" or "year".
+
+        Returns points (oldest first, every period filled in so quiet periods show 0, each
+        with period start date, transactions, new_sales, sub_sales, resales, median_price and
+        median_psf in SGD), total_transactions, average_per_period, recent_periods (how many
+        periods "recent" means: 3 months, 2 quarters or 1 year), recent_transactions,
+        prior_transactions (the same number of periods before that), volume_change_pct (recent
+        versus prior, null if there were no prior sales) and notes. The latest period is
+        probably incomplete because URA publishes with a delay, so it is shown in points but
+        left out of recent_transactions, prior_transactions and volume_change_pct.
+        """
+        filters = TransactionFilters.from_inputs(
+            project,
+            district,
+            type_of_sale,
+            start_date,
+            end_date,
+            segment=segment,
+        )
+        return service.market_activity(filters, period)
+
+    @mcp.tool
+    def estimate_value(
+        project: str,
+        area_sqft: float,
+        floor: int | None = None,
+        type_of_sale: str | None = None,
+        radius_m: int = 1500,
+        months: int = 24,
+        max_peers: int = 12,
+    ) -> ValueEstimate:
+        """Estimate what a unit in a project would sell for, with a range, using regression.
+
+        Fits a regression of log price on recent sales of the project and similar projects
+        nearby (same property type, within `radius_m` metres), controlling for unit size,
+        floor, new-sale versus resale and the month (market trend), plus remaining lease and
+        freehold when the project has too few sales of its own. It then predicts the price of the
+        unit described by the arguments at the latest month of data.
+
+        Two modes (model.mode). "project": the project has at least 5 sales of its own, so each
+        project gets its own price level and size, floor, sale-type and trend effects are learned
+        from variation within projects; the estimate sits at this project's own price level.
+        "area": the project has too few sales, so the model compares across projects and the
+        estimate reflects the surrounding area. Its lease and freehold effects are less
+        reliable because they can be confounded with project quality. Use search_projects first
+        to get the exact project name. Prices are SGD and areas sqft.
+
+        This is a statistical estimate from recorded prices, not a formal valuation: it cannot
+        see view, facing, renovation or the exact unit. Always show the user the range, the
+        notes, and the comparable_check. For context call market_activity (is the market
+        liquid and which way is it moving) and compare_nearby (how the project compares).
+
+        Args:
+            project: Exact project name, case-insensitive.
+            area_sqft: Size of the unit in square feet, required. Sales from half to double
+                this size are used.
+            floor: Floor of the unit, 1-100. Default: the floor typically sold in the project.
+                Ignored for landed property, which has no floor.
+            type_of_sale: "New Sale" or "Resale" ("Sub Sale" is treated like resale). Default
+                is resale. New launches and resales price differently, so set this for a
+                unit bought from a developer.
+            radius_m: Radius in metres for similar projects, 100-3000 (default 1500). Projects
+                without coordinates use the same street, then district, instead.
+            months: Months of sales to use, ending at the latest data month, 6-60 (default 24).
+            max_peers: Max similar projects to include, 1-50 (default 12, nearest first).
+
+        Returns: estimate (median, low and high in SGD, an 80% range, and the implied psf; null
+        if there are too few comparable sales), unit (what was valued, including remaining
+        lease), model (mode, sales_used, projects, r_squared, typical_error_pct,
+        outliers_removed and the features fitted), effects (what the model learned, as
+        percentages: price change for 10% more area, per 10 floors, per 10 years of lease, the
+        freehold and new-sale premiums, the monthly trend, and target_project_premium_pct, this
+        project's price level versus similar projects; null where not estimable), comparable_check
+        (the median psf of the project's own sales within 20% of the size, or of nearby sales if
+        the project has too few, and the value it implies, as a sanity check on the regression;
+        source says which), activity (sales in the sample over the last 3 complete months versus
+        the 3 before, as a liquidity and momentum signal), peers (the projects
+        used) and notes (warnings: small sample, weak fit, extrapolation, no project-specific
+        effect). Large gaps between estimate and comparable_check mean the estimate is shaky.
+        """
+        query = ValuationQuery.from_inputs(
+            project, area_sqft, floor, type_of_sale, radius_m, months, max_peers
+        )
+        return service.estimate_value(query)

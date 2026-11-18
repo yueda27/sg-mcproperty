@@ -281,6 +281,37 @@ PROJECT_SUMMARY_SQL = Template(
 )
 
 
+# Monthly (or quarterly, yearly) counts split by sale type, with median price and psf.
+MARKET_ACTIVITY_SQL = Template(
+    """
+    SELECT
+        $period_fn(contract_date) AS period,
+        count() AS transactions,
+        countIf(type_of_sale = 'New Sale') AS new_sales,
+        countIf(type_of_sale = 'Sub Sale') AS sub_sales,
+        countIf(type_of_sale = 'Resale') AS resales,
+        round(quantileExact(0.5)(price)) AS median_price,
+        round(quantileExactIf(0.5)(price / area_sqft, area_sqft > 0)) AS median_psf
+    FROM $table
+    $where
+    GROUP BY period
+    ORDER BY period
+    LIMIT 200
+    """
+)
+
+# Raw sales of the chosen projects, the input to the valuation regression. Bounded by LIMIT.
+VALUATION_SAMPLE_SQL = Template(
+    """
+    SELECT project, area_sqft, floor, price, contract_date, type_of_sale, tenure, lease_year
+    FROM $table
+    WHERE project IN {projects:Array(String)} AND area_sqft > 0 AND price > 0 $peer_filters
+    ORDER BY contract_date DESC
+    LIMIT {limit:UInt32}
+    """
+)
+
+
 # --- Repository (data access) -------------------------------------------------------------------
 
 
@@ -411,6 +442,18 @@ class PrivateResidentialRepository:
             "prior_start": prior_start.isoformat(),
         }
         return self._accessor.query(sql, params)[0]
+
+    def market_activity(self, filters: TransactionFilters, period_fn: str) -> list[dict[str, Any]]:
+        where, params = filters.to_sql()
+        sql = MARKET_ACTIVITY_SQL.substitute(table=self._table, where=where, period_fn=period_fn)
+        return self._accessor.query(sql, params)
+
+    def valuation_sample(
+        self, projects: list[str], filters: PeerFilters, limit: int
+    ) -> list[dict[str, Any]]:
+        peer_sql, params = filters.to_sql()
+        sql = VALUATION_SAMPLE_SQL.substitute(table=self._table, peer_filters=peer_sql)
+        return self._accessor.query(sql, {**params, "projects": projects, "limit": limit})
 
     @property
     def _table(self) -> str:

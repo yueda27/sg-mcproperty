@@ -2,12 +2,17 @@ from datetime import date
 
 import pytest
 
-from sg_mcproperty.server.private_residential import NearbyQuery, TransactionFilters
+from sg_mcproperty.server.private_residential import (
+    NearbyQuery,
+    TransactionFilters,
+    ValuationQuery,
+)
 from sg_mcproperty.server.private_residential.filters import (
     PeerFilters,
     add_months,
     normalise_project_name,
     normalise_project_query,
+    period_start,
     resolve_segment,
     segment_of,
     validate_period,
@@ -152,6 +157,7 @@ def test_nearby_query_normalises_and_computes_size_band():
     assert query.project == "TREASURE AT TAMPINES" and query.type_of_sale == "Resale"
     assert query.size_band() == (800.0, 1200.0)
     assert NearbyQuery.from_inputs("x1").size_band() == (None, None)
+    assert NearbyQuery.from_inputs("x1", max_peers=50).max_peers == 50
 
 
 @pytest.mark.parametrize(
@@ -163,7 +169,7 @@ def test_nearby_query_normalises_and_computes_size_band():
         {"months": 0},
         {"months": 61},
         {"max_peers": 0},
-        {"max_peers": 21},
+        {"max_peers": 51},
         {"area_sqft": 0},
         {"type_of_sale": "Lease"},
         {"lease_year_tolerance": -1},
@@ -179,3 +185,43 @@ def test_normalise_project_name():
     assert normalise_project_name("  parktown   residence ") == "PARKTOWN RESIDENCE"
     with pytest.raises(ValueError):
         normalise_project_name("   ")
+
+
+def test_period_start():
+    day = date(2026, 11, 17)
+    assert period_start(day, "month") == date(2026, 11, 1)
+    assert period_start(day, "quarter") == date(2026, 10, 1)
+    assert period_start(date(2026, 3, 31), "quarter") == date(2026, 1, 1)
+    assert period_start(day, "year") == date(2026, 1, 1)
+
+
+def test_valuation_query_normalises_and_defaults():
+    query = ValuationQuery.from_inputs(
+        " treasure  at tampines ", 1000, floor=12, type_of_sale="new sale"
+    )
+    assert query.project == "TREASURE AT TAMPINES" and query.type_of_sale == "New Sale"
+    assert (query.radius_m, query.months, query.max_peers) == (1500, 24, 12)
+    assert ValuationQuery.from_inputs("x1", 900).type_of_sale is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"project": " "},
+        {"area_sqft": 0},
+        {"area_sqft": -5},
+        {"area_sqft": 50_000},
+        {"floor": 0},
+        {"floor": 101},
+        {"radius_m": 99},
+        {"radius_m": 3001},
+        {"months": 5},
+        {"months": 61},
+        {"max_peers": 0},
+        {"max_peers": 51},
+        {"type_of_sale": "Lease"},
+    ],
+)
+def test_valuation_query_rejects_bad_inputs(kwargs):
+    with pytest.raises(ValueError):
+        ValuationQuery.from_inputs(**{"project": "AUREA", "area_sqft": 900, **kwargs})

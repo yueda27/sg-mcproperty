@@ -174,3 +174,44 @@ def test_project_summary_user_input_stays_in_parameters():
     )
     sql, params = accessor.calls[0]
     assert "DROP" not in sql and "DROP" in params["project"]
+
+
+# --- market activity and valuation sample -------------------------------------------------------
+
+
+def test_market_activity_sql_uses_period_function_and_filters():
+    accessor = FakeAccessor([])
+    PrivateResidentialRepository(accessor).market_activity(
+        TransactionFilters.from_inputs(district=9, segment="landed"), "toStartOfQuarter"
+    )
+    sql, params = accessor.calls[0]
+    assert "toStartOfQuarter(contract_date)" in sql and "$" not in sql
+    assert "district = {district:UInt8}" in sql and "property_type IN" in sql
+    assert params["district"] == 9 and params["property_types"] == [
+        "Terrace",
+        "Semi-detached",
+        "Detached",
+    ]
+    assert "countIf(type_of_sale = 'New Sale')" in sql and "LIMIT" in sql
+
+
+def test_valuation_sample_is_bounded_and_parameterised():
+    accessor = FakeAccessor([])
+    filters = PeerFilters(
+        ("Condominium",), date(2024, 12, 1), min_area_sqft=500.0, max_area_sqft=2000.0
+    )
+    PrivateResidentialRepository(accessor).valuation_sample(["A", "B"], filters, 500)
+    sql, params = accessor.calls[0]
+    assert "project IN {projects:Array(String)}" in sql and "LIMIT {limit:UInt32}" in sql
+    assert "area_sqft > 0 AND price > 0" in sql and "$" not in sql
+    assert params["projects"] == ["A", "B"] and params["limit"] == 500
+    assert params["min_area_sqft"] == 500.0
+
+
+def test_valuation_sample_user_input_stays_in_parameters():
+    accessor = FakeAccessor([])
+    PrivateResidentialRepository(accessor).valuation_sample(
+        ["x'; DROP TABLE t; --"], PEER_FILTERS, 10
+    )
+    sql, params = accessor.calls[0]
+    assert "DROP" not in sql and params["projects"] == ["x'; DROP TABLE t; --"]

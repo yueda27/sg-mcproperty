@@ -25,9 +25,12 @@ PERIODS = {"month": "toStartOfMonth", "quarter": "toStartOfQuarter", "year": "to
 MIN_RADIUS_M = 100
 MAX_RADIUS_M = 3000
 MAX_MONTHS = 60
-MAX_PEERS = 20
+MAX_PEERS = 50
 AREA_BAND = 0.2  # +/-20% around a requested size
 MAX_LEASE_YEAR_TOLERANCE = 60
+MIN_VALUATION_MONTHS = 6
+MAX_UNIT_AREA_SQFT = 20000
+MAX_FLOOR = 100
 AGE_GAP_NOTE_YEARS = 15  # peers whose lease start differs this much are flagged as a different age
 
 
@@ -110,6 +113,15 @@ def validate_period(period: str) -> str:
     if key not in PERIODS:
         raise ValueError(f"period must be one of {sorted(PERIODS)}")
     return key
+
+
+def period_start(day: date, period: str) -> date:
+    """First day of the month, quarter or year ("month", "quarter", "year") containing `day`."""
+    if period == "year":
+        return date(day.year, 1, 1)
+    if period == "quarter":
+        return date(day.year, 3 * ((day.month - 1) // 3) + 1, 1)
+    return day.replace(day=1)
 
 
 def add_months(day: date, months: int) -> date:
@@ -312,3 +324,46 @@ class NearbyQuery:
         if self.area_sqft is None:
             return None, None
         return self.area_sqft * (1 - AREA_BAND), self.area_sqft * (1 + AREA_BAND)
+
+
+@dataclass(frozen=True)
+class ValuationQuery:
+    """Validated inputs for estimating the value of one unit in a project."""
+
+    project: str
+    area_sqft: float
+    floor: int | None = None
+    type_of_sale: str | None = None
+    radius_m: int = 1500
+    months: int = 24
+    max_peers: int = 12
+
+    @classmethod
+    def from_inputs(
+        cls,
+        project: str,
+        area_sqft: float,
+        floor: int | None = None,
+        type_of_sale: str | None = None,
+        radius_m: int = 1500,
+        months: int = 24,
+        max_peers: int = 12,
+    ) -> "ValuationQuery":
+        if not _squash(project):
+            raise ValueError("project is required")
+        if not 0 < area_sqft <= MAX_UNIT_AREA_SQFT:
+            raise ValueError(f"area_sqft must be between 0 and {MAX_UNIT_AREA_SQFT}")
+        if floor is not None and not 1 <= floor <= MAX_FLOOR:
+            raise ValueError(f"floor must be between 1 and {MAX_FLOOR}")
+        if not MIN_RADIUS_M <= radius_m <= MAX_RADIUS_M:
+            raise ValueError(f"radius_m must be between {MIN_RADIUS_M} and {MAX_RADIUS_M}")
+        if not MIN_VALUATION_MONTHS <= months <= MAX_MONTHS:
+            raise ValueError(f"months must be between {MIN_VALUATION_MONTHS} and {MAX_MONTHS}")
+        if not 1 <= max_peers <= MAX_PEERS:
+            raise ValueError(f"max_peers must be between 1 and {MAX_PEERS}")
+        sale = None
+        if type_of_sale is not None:
+            sale = TYPES_OF_SALE.get(_squash(type_of_sale))
+            if sale is None:
+                raise ValueError(f"type_of_sale must be one of {sorted(TYPES_OF_SALE.values())}")
+        return cls(_squash(project), area_sqft, floor, sale, radius_m, months, max_peers)

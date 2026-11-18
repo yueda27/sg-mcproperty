@@ -59,6 +59,8 @@ def test_tools_prompts_and_resources_are_registered():
         "compare_nearby",
         "dataset_info",
         "project_summary",
+        "market_activity",
+        "estimate_value",
     }
     assert prompts == {"project_overview", "recent_deals", "value_project"}
     assert resources == {

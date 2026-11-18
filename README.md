@@ -9,8 +9,9 @@ URA API --(sg-property-load --dump)--> output/*.parquet --(to_clickhouse)--> Cli
 ```
 
 Status: private residential transactions are fetched, transformed, dumped to parquet and
-loaded into ClickHouse. The MCP server has six tools (`search_projects`, `search_transactions`,
-`price_trend`, `compare_nearby`, `dataset_info`, `project_summary`), three prompts and two resources for that dataset. More tools are
+loaded into ClickHouse. The MCP server has eight tools (`search_projects`, `search_transactions`,
+`price_trend`, `compare_nearby`, `dataset_info`, `project_summary`, `market_activity`,
+`estimate_value`), three prompts and two resources for that dataset. More tools are
 planned (see [TODO](#todo)).
 
 ## 1. Prerequisites
@@ -142,12 +143,14 @@ What it exposes for private residential data:
 | Tool | `search_projects` | Find exact project names from a fuzzy or misspelled name, optionally by district |
 | Tool | `dataset_info` | What the data covers: counts, date range, valid districts, sale types and segments, and coordinate coverage. Call it to learn valid filter values and data freshness |
 | Tool | `project_summary` | One project's profile: tenure, sales mix, price, psf and area ranges, and the latest 12 months versus the 12 before |
+| Tool | `market_activity` | Sales per month, quarter or year split by sale type, with the volume change over complete periods. A liquidity and momentum check before trusting a price |
+| Tool | `estimate_value` | Regression estimate of what a unit would sell for, with a range (see below) |
 | Tool | `search_transactions` | List transactions, newest first, filtered by project, district, segment, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
 | Tool | `price_trend` | Median price and psf per month, quarter or year, for a project, district or the market. Flags thin periods and reports the psf change |
 | Tool | `compare_nearby` | Compares one project's psf with similar projects nearby to value it (see below) |
 | Prompt | `project_overview` | Guides the model through summarising one project's recent sales |
 | Prompt | `recent_deals` | Guides the model through listing notable sales in a district |
-| Prompt | `value_project` | Guides the model through a full "is this project priced high or low?" assessment |
+| Prompt | `value_project` | Guides the model through a full assessment: liquidity, comparison with nearby projects, a unit estimate and the price trend |
 | Resource | `property://private-residential/schema` | Column meanings, units and caveats |
 | Resource | `property://private-residential/coverage` | Live row count, project count and date range |
 
@@ -173,6 +176,38 @@ python -m sg_mcproperty.server.dev_client call compare_nearby "project=treasure 
   the same district (`basis` says which, and `distance_m` is null).
 - It is an indicative comparison of recorded prices, not a valuation: it ignores floor, view and
   unit condition.
+
+### Estimating a unit's value (`estimate_value`)
+
+```bash
+python -m sg_mcproperty.server.dev_client call estimate_value "project=treasure at tampines" area_sqft=1000 floor=12
+python -m sg_mcproperty.server.dev_client call estimate_value project=aurea area_sqft=700 "type_of_sale=new sale"
+```
+
+It fits a regression of log price on the last `months` (default 24) of sales in the project and
+similar projects nearby (same property type, within `radius_m`, else the same street or district),
+then predicts the unit you describe at the latest month of data. The result has a median, an 80%
+range, the model fit, what it learned (percentage effects of size, floor, sale type and the monthly
+trend), a sanity check against the project's own median psf, and notes.
+
+- **Two modes** (`model.mode`). With at least 5 sales of its own the project gets its own price
+  level ("project" mode): size, floor, sale-type and trend effects are learned from variation
+  *within* projects, so project quality cannot leak into them, and the estimate sits at this
+  project's own level. With fewer sales ("area" mode) the model compares across projects and the
+  estimate reflects the surrounding area. The lease and freehold effects are only estimated in
+  area mode, where they can be confounded with project quality.
+- **Accuracy**, from `scripts/backtest_estimate.py` (fit on older sales, predict held-out later
+  ones, 25 busy projects, four hold-out periods, about 1,200 held-out sales): the median absolute
+  error was 3.4-4.1% and the 90th percentile 9-14%. The plain 80% interval was too narrow
+  out of sample, so it is widened by 15% (`INTERVAL_SCALE`): coverage was then 74-85% by period
+  and about 81% pooled. The most recent hold-out period was the worst (74% coverage and a -3%
+  bias in a rising market), which is the period that matters most, so treat the range as a guide.
+  Re-run the script after reloading data: `python scripts/backtest_estimate.py --holdout-start 20`.
+- **It cannot see** view, facing, renovation or the exact unit, so it is a statistical estimate,
+  not a valuation. Always read the notes: small samples, weak fit, extrapolation beyond the sizes
+  or floors sold, and project mode versus area mode.
+- It is plain Python on a few hundred rows (`server/private_residential/regression.py`), with no
+  numpy dependency.
 
 ### Trying the tools without an MCP client
 
@@ -226,7 +261,7 @@ uv run ruff check . && uv run ruff format .
 ```
 
 `tests/server/private_residential/` mirrors the source (`test_filters.py`, `test_repository.py`,
-`test_service.py`). The service tests use a fake repository and the repository tests use a fake
+`test_service.py`, `test_regression.py`). The service tests use a fake repository and the repository tests use a fake
 accessor, so most tests need no database. A few tests run against live ClickHouse and skip
 themselves when it is not running or the table is empty.
 
@@ -250,6 +285,7 @@ loader does not exist in this repo.
 | `src/sg_mcproperty/server/private_residential/` | `filters.py`, `repository.py`, `service.py` for the dataset |
 | `src/sg_mcproperty/server/{tools,prompts,resources}/` | MCP adapters, one module per dataset |
 | `src/sg_mcproperty/server/dev_client.py` | Terminal client for trying tools during development |
+| `scripts/backtest_estimate.py` | Backtests `estimate_value` on held-out sales (accuracy and interval coverage) |
 | `tests/server/` | Server tests, mirroring the source layout |
 | `output/` | Parquet dumps (gitignored) |
 | `clickhouse_db/` | Local ClickHouse server data (gitignored) |
@@ -259,8 +295,8 @@ loader does not exist in this repo.
 1. ~~Setup loading script~~ done for private residential. HDB resale loader still to do
 2. ~~Setup tables~~ done for private residential
 3. ~~Setup MCP tools~~ `search_projects`, `search_transactions`, `price_trend` and `compare_nearby`
-   `dataset_info` and `project_summary` done. Still planned: `rank_projects`, `market_activity`,
-   `affordability_search`
+   `dataset_info`, `project_summary`, `market_activity` and `estimate_value` done. Still planned:
+   `rank_projects`, `affordability_search`
 4. ~~Keep URA `propertyType` and the coordinates~~ done. `typeOfArea` and `marketSegment` are still
    dropped. Fill in coordinates for projects URA leaves blank (for example by geocoding the street)
 5. Add URA rental contracts (`noOfBedRoom`) to estimate bedrooms per transaction

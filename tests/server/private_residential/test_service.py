@@ -1,3 +1,4 @@
+import math
 from datetime import date
 
 import pytest
@@ -8,6 +9,7 @@ from sg_mcproperty.server.private_residential import (
     PrivateResidentialRepository,
     PrivateResidentialService,
     TransactionFilters,
+    ValuationQuery,
 )
 from sg_mcproperty.server.private_residential.service import (
     MAX_PROJECT_RESULTS,
@@ -17,12 +19,14 @@ from sg_mcproperty.server.private_residential.service import (
 from .helpers import (
     FakeAnalysisRepository,
     FakeRepository,
+    activity_row,
     facets_row,
     peer_row,
     profile_row,
     project_row,
     stats_row,
     summary_row,
+    synthetic_sample,
     transaction_row,
 )
 
@@ -347,6 +351,210 @@ def test_project_summary_unknown_or_empty_project():
         PrivateResidentialService(FakeAnalysisRepository()).project_summary("  ")
 
 
+# --- market activity ---------------------------------------------------------------------------
+
+
+def _activity(rows, period="month", **filters):
+    repo = FakeAnalysisRepository(activity=rows)
+    out = PrivateResidentialService(repo).market_activity(
+        TransactionFilters.from_inputs(segment="auto", **filters), period
+    )
+    return out, repo
+
+
+def test_market_activity_fills_quiet_periods_through_the_latest_data_month():
+    rows = [activity_row(date(2026, 5, 1), 10), activity_row(date(2026, 8, 1), 4, new=4)]
+    out, repo = _activity(rows)
+    assert [p["period"] for p in out["points"]] == [
+        "2026-05-01", "2026-06-01", "2026-07-01", "2026-08-01",
+        "2026-09-01", "2026-10-01", "2026-11-01",
+    ]  # fmt: skip
+    quiet = out["points"][1]
+    assert quiet["transactions"] == 0 and quiet["median_psf"] is None
+    assert repo.calls[0][2] == "toStartOfMonth"
+    assert out["total_transactions"] == 14 and out["average_per_period"] == 2.0
+
+
+def test_market_activity_compares_complete_periods_and_skips_the_latest():
+    rows = [
+        activity_row(date(2026, m, 1), n)
+        for m, n in ((5, 6), (6, 6), (7, 6), (8, 12), (9, 12), (10, 12), (11, 1))
+    ]  # Nov: partial
+    out, _ = _activity(rows)
+    assert out["recent_periods"] == 3
+    assert (
+        out["recent_transactions"] == 36 and out["prior_transactions"] == 18
+    )  # Aug-Oct vs May-Jul
+    assert out["volume_change_pct"] == 100.0
+    assert any("may be incomplete" in n for n in out["notes"])
+
+
+def test_market_activity_quarters_and_sale_type_split():
+    rows = [activity_row(date(2026, 1, 1), 9, new=3, sub=2), activity_row(date(2026, 4, 1), 5)]
+    out, repo = _activity(rows, period="quarter")
+    assert repo.calls[0][2] == "toStartOfQuarter" and out["recent_periods"] == 2
+    first = out["points"][0]
+    assert (first["new_sales"], first["sub_sales"], first["resales"]) == (3, 2, 4)
+    assert [p["period"] for p in out["points"]][-1] == "2026-10-01"
+
+
+def test_market_activity_empty_and_no_prior_sales():
+    empty, _ = _activity([])
+    assert empty["points"] == [] and empty["average_per_period"] is None
+    assert "No transactions" in empty["notes"][0] and empty["volume_change_pct"] is None
+    only_recent, _ = _activity([activity_row(date(2026, 10, 1), 5)])
+    assert only_recent["prior_transactions"] == 0 and only_recent["volume_change_pct"] is None
+
+
+def test_market_activity_notes_mixed_segments_and_rejects_bad_period():
+    mixed = PrivateResidentialService(
+        FakeAnalysisRepository(activity=[activity_row(date(2026, 1, 1))])
+    )
+    out = mixed.market_activity(TransactionFilters.from_inputs(segment="all"), "month")
+    assert any("landed and non-landed" in n for n in out["notes"])
+    with pytest.raises(ValueError):
+        mixed.market_activity(TransactionFilters(), "week")
+
+
+# --- estimate value -----------------------------------------------------------------------------
+
+LEVELS = {"TARGET": 13.0, "NEAR A": 13.3, "NEAR B": 12.8}
+
+
+def _estimate(profile=None, sample=None, query=None, **repo_kwargs):
+    repo = FakeAnalysisRepository(
+        profile=profile or profile_row(),
+        distance_peers=[peer_row("NEAR A", 400), peer_row("NEAR B", 900)],
+        sample=synthetic_sample(LEVELS) if sample is None else sample,
+        **repo_kwargs,
+    )
+    query = query or ValuationQuery.from_inputs("target", 1000, floor=12)
+    return PrivateResidentialService(repo).estimate_value(query), repo
+
+
+def test_estimate_value_project_mode_matches_the_known_truth():
+    out, repo = _estimate()
+    truth = math.exp(13.0 + 0.9 * math.log(1000) + 0.03 * 1.2 + 0.004 * 23)
+    assert out["model"]["mode"] == "project" and out["model"]["r_squared"] > 0.95
+    assert out["estimate"]["median"] == pytest.approx(truth, rel=0.02)
+    assert out["estimate"]["low"] < out["estimate"]["median"] < out["estimate"]["high"]
+    assert out["estimate"]["psf"] == pytest.approx(out["estimate"]["median"] / 1000, abs=1)
+    assert out["unit"] == {
+        "area_sqft": 1000.0, "floor": 12, "type_of_sale": "Resale",
+        "remaining_lease_years": 91.0, "freehold": False,
+    }  # fmt: skip
+    # the sample is the target plus its peers, limited to sizes half to double the unit
+    _, names, filters, limit = next(c for c in repo.calls if c[0] == "valuation_sample")
+    assert names == ["TARGET", "NEAR A", "NEAR B"] and limit == 20_000
+    assert (filters.min_area_sqft, filters.max_area_sqft) == (500.0, 2000.0)
+    assert (out["window_start"], out["window_end"]) == ("2024-12-01", "2026-11-01")
+
+
+def test_estimate_value_effects_are_reported_as_percentages():
+    (effects,) = [_estimate()[0]["effects"]]
+    assert effects["size_plus_10pct_area_pct"] == pytest.approx((1.1**0.9 - 1) * 100, abs=0.2)
+    # the floor effect is small next to the 3% noise, so allow about two standard errors
+    assert effects["per_10_floors_pct"] == pytest.approx((math.exp(0.03) - 1) * 100, abs=1.0)
+    assert effects["new_sale_premium_pct"] == pytest.approx((math.exp(0.07) - 1) * 100, abs=0.5)
+    assert effects["monthly_trend_pct"] == pytest.approx((math.exp(0.004) - 1) * 100, abs=0.25)
+    # TARGET (13.0) is between the dearer NEAR A (13.3) and cheaper NEAR B (12.8): about -5% to +5%
+    assert effects["target_project_premium_pct"] == pytest.approx(
+        -((13.3 - 13.0) + (12.8 - 13.0)) / 2 * 100, abs=2
+    )
+    assert effects["per_10_years_lease_pct"] is None and effects["freehold_premium_pct"] is None
+
+
+def test_estimate_value_new_sale_prices_above_resale():
+    resale, _ = _estimate()
+    new, _ = _estimate(
+        query=ValuationQuery.from_inputs("target", 1000, floor=12, type_of_sale="new sale")
+    )
+    assert new["unit"]["type_of_sale"] == "New Sale"
+    ratio = new["estimate"]["median"] / resale["estimate"]["median"]
+    assert ratio == pytest.approx(math.exp(0.07), abs=0.01)
+    assert any("Valued as a resale unit" in n for n in resale["notes"])
+    assert not any("Valued as a resale unit" in n for n in new["notes"])
+
+
+def test_estimate_value_comparable_check_prefers_the_projects_own_sales():
+    out, _ = _estimate()
+    check = out["comparable_check"]
+    assert check["source"] == "project" and check["sales_used"] >= 5
+    assert check["implied_value"] == pytest.approx(check["median_psf"] * 1000, abs=1000)
+
+
+def test_estimate_value_area_mode_when_the_project_has_few_sales():
+    sample = [r for r in synthetic_sample(LEVELS) if r["project"] != "TARGET"] + [
+        r for r in synthetic_sample({"TARGET": 13.0}, per_project=2)
+    ]
+    out, _ = _estimate(sample=sample)
+    assert out["model"]["mode"] == "area"
+    assert any("only 2 sales" in n and "confounded" in n for n in out["notes"])
+    none, _ = _estimate(sample=[r for r in synthetic_sample(LEVELS) if r["project"] != "TARGET"])
+    assert any("no sales in the window" in n for n in none["notes"])
+    assert out["comparable_check"]["source"] == "nearby"
+
+
+def test_estimate_value_without_enough_sales_returns_no_estimate():
+    out, _ = _estimate(sample=synthetic_sample(LEVELS, per_project=5))
+    assert out["estimate"] is None and out["model"] is None and out["effects"] is None
+    assert any("no estimate was made" in n for n in out["notes"])
+
+
+def test_estimate_value_default_floor_is_the_floor_typically_sold():
+    out, _ = _estimate(query=ValuationQuery.from_inputs("target", 1000))
+    assert 1 <= out["unit"]["floor"] <= 30
+
+
+def test_estimate_value_warns_about_extrapolation_noise_and_small_samples():
+    big_unit, _ = _estimate(query=ValuationQuery.from_inputs("target", 1400, floor=12))
+    assert not any("extrapolates" in n for n in big_unit["notes"])  # inside the sizes sold
+    outside, _ = _estimate(query=ValuationQuery.from_inputs("target", 2000, floor=60))
+    notes = " | ".join(outside["notes"])
+    assert "size is outside" in notes and "floor is outside" in notes
+    noisy, _ = _estimate(sample=synthetic_sample(LEVELS, noise=0.25))
+    assert any("rough" in n or "Weak fit" in n for n in noisy["notes"])
+    small, _ = _estimate(sample=synthetic_sample(LEVELS, per_project=12))
+    assert any("Small sample" in n for n in small["notes"])
+
+
+def test_estimate_value_falls_back_to_street_when_the_project_has_no_coordinates():
+    repo = FakeAnalysisRepository(
+        profile=profile_row(x=None, y=None),
+        street_peers=[peer_row("NEAR A"), peer_row("NEAR B")],
+        sample=synthetic_sample(LEVELS),
+    )
+    out = PrivateResidentialService(repo).estimate_value(ValuationQuery.from_inputs("target", 1000))
+    assert out["basis"] == "street" and out["radius_m"] is None
+    assert any("no coordinates" in n for n in out["notes"])
+
+
+def test_estimate_value_landed_uses_no_floor():
+    sample = [{**r, "floor": None} for r in synthetic_sample(LEVELS)]
+    out, _ = _estimate(profile=profile_row(property_type="Terrace"), sample=sample)
+    assert out["segment"] == "landed" and out["unit"]["floor"] is None
+    assert "floor_10" not in out["model"]["features"]
+
+
+def test_estimate_value_freehold_unit_has_no_remaining_lease():
+    out, _ = _estimate(profile=profile_row(tenure="Freehold", lease_year=None))
+    assert out["unit"]["freehold"] is True and out["unit"]["remaining_lease_years"] is None
+
+
+def test_estimate_value_activity_uses_complete_months_only():
+    out, _ = _estimate()
+    activity = out["activity"]
+    assert activity["sales_in_sample"] >= out["model"]["sales_used"]
+    assert activity["last_3_months"] > 0 and activity["prior_3_months"] > 0
+
+
+def test_estimate_value_unknown_project():
+    with pytest.raises(ValueError, match="search_projects"):
+        PrivateResidentialService(FakeAnalysisRepository(profile=None)).estimate_value(
+            ValuationQuery.from_inputs("nope", 900)
+        )
+
+
 # --- live ClickHouse (skipped when unavailable) -------------------------------------------------
 
 
@@ -437,3 +645,38 @@ def test_live_project_summary_matches_other_tools(live_service):
     assert summary["price"]["min"] <= summary["price"]["median"] <= summary["price"]["max"]
     assert summary["psf"]["p25"] <= summary["psf"]["median"] <= summary["psf"]["p75"]
     assert summary["segment"] == "non-landed" and summary["district"] == 7
+
+
+def test_live_market_activity_matches_price_trend_counts(live_service):
+    filters = TransactionFilters.from_inputs(project="aurea", segment="auto")
+    activity = live_service.market_activity(filters, "quarter")
+    trend = live_service.price_trend(filters, "quarter")
+    assert activity["total_transactions"] == sum(p["transactions"] for p in trend["points"]) == 75
+    assert all(
+        p["transactions"] == p["new_sales"] + p["sub_sales"] + p["resales"]
+        for p in activity["points"]
+    )
+    assert activity["points"][-1]["period"] == "2026-10-01"  # filled through the latest data month
+
+
+def test_live_estimate_value_is_consistent_with_the_projects_own_prices(live_service):
+    out = live_service.estimate_value(
+        ValuationQuery.from_inputs("treasure at tampines", 1000, floor=12)
+    )
+    if out["estimate"] is None:
+        pytest.skip("not enough sales in this dataset")
+    assert out["model"]["mode"] == "project" and out["model"]["r_squared"] > 0.8
+    estimate, check = out["estimate"], out["comparable_check"]
+    assert estimate["low"] < estimate["median"] < estimate["high"]
+    # a regression estimate and the project's own median psf should be in the same ballpark
+    assert check["source"] == "project"
+    assert estimate["psf"] == pytest.approx(check["median_psf"], rel=0.25)
+
+
+def test_live_estimate_value_for_a_project_without_coordinates(live_service):
+    out = live_service.estimate_value(
+        ValuationQuery.from_inputs("aurea", 700, type_of_sale="new sale")
+    )
+    assert out["basis"] in ("street", "district")
+    if out["estimate"] is not None:
+        assert out["estimate"]["psf"] > 0 and out["unit"]["type_of_sale"] == "New Sale"

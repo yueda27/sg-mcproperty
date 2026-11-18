@@ -1,6 +1,8 @@
 """Fakes and row builders shared by the private residential tests."""
 
-from datetime import datetime
+import math
+import random
+from datetime import date, datetime
 
 
 class FakeAccessor:
@@ -157,6 +159,55 @@ def summary_row(**overrides):
     return {**row, **overrides}
 
 
+def synthetic_sample(
+    levels, per_project=40, seed=3, noise=0.03, months=24, start=date(2024, 12, 1)
+):
+    """Sales with known structure: ln price = level[project] + 0.9 ln(area) + 0.03 floor/10
+    + 0.004 month + 0.07 new_sale + noise. `levels` maps project -> log price level."""
+    rng = random.Random(seed)
+    rows = []
+    for project, level in levels.items():
+        for _ in range(per_project):
+            area = rng.uniform(600, 1500)
+            floor = rng.randint(1, 30)
+            month = rng.randint(0, months - 2)
+            new_sale = rng.random() < 0.2
+            ln_price = (
+                level
+                + 0.9 * math.log(area)
+                + 0.03 * floor / 10
+                + 0.004 * month
+                + 0.07 * new_sale
+                + rng.gauss(0, noise)
+            )
+            index = start.year * 12 + start.month - 1 + month
+            rows.append(
+                {
+                    "project": project,
+                    "area_sqft": area,
+                    "floor": floor,
+                    "price": math.exp(ln_price),
+                    "contract_date": datetime(index // 12, index % 12 + 1, 1),
+                    "type_of_sale": "New Sale" if new_sale else "Resale",
+                    "tenure": "99 years",
+                    "lease_year": 2015,
+                }
+            )
+    return rows
+
+
+def activity_row(period, transactions=10, new=0, sub=0, resale=None, psf=2000.0):
+    return {
+        "period": period,
+        "transactions": transactions,
+        "new_sales": new,
+        "sub_sales": sub,
+        "resales": transactions - new - sub if resale is None else resale,
+        "median_price": psf * 1000.0,
+        "median_psf": psf,
+    }
+
+
 class FakeAnalysisRepository:
     """Repository stand-in for price_trend and compare_nearby. Records the calls made."""
 
@@ -172,6 +223,8 @@ class FakeAnalysisRepository:
         facets=None,
         type_counts=(),
         summary=None,
+        sample=(),
+        activity=(),
     ):
         self.trend = list(trend)
         self.profile = profile
@@ -183,6 +236,8 @@ class FakeAnalysisRepository:
         self.facets = facets or facets_row()
         self.type_counts = list(type_counts)
         self.summary = summary or summary_row()
+        self.sample = list(sample)
+        self.activity = list(activity)
         self.calls = []
 
     def price_trend(self, filters, period_fn):
@@ -226,3 +281,11 @@ class FakeAnalysisRepository:
     def project_summary(self, project, recent_start, prior_start):
         self.calls.append(("project_summary", project, recent_start, prior_start))
         return self.summary
+
+    def valuation_sample(self, projects, filters, limit):
+        self.calls.append(("valuation_sample", projects, filters, limit))
+        return self.sample
+
+    def market_activity(self, filters, period_fn):
+        self.calls.append(("market_activity", filters, period_fn))
+        return self.activity
