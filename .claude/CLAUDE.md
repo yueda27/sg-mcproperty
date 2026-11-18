@@ -17,7 +17,8 @@ data/ (raw files) --loaders--> ClickHouse <--migrations define schema
 | `clickhouse/migrations/NNNN_name.sql` | Versioned DDL, applied in order by `sg-property-migrate` |
 | `src/sg_mcproperty/migrate.py` | Migration runner (tracks applied files + checksums in `schema_migrations`) |
 | `src/sg_mcproperty/loaders/` | One module per dataset + `cli.py` registry (`sg-property-load`) |
-| `src/sg_mcproperty/server/` | FastMCP app (`app.py`) and tool modules (`tools/`) |
+| `src/sg_mcproperty/server/` | FastMCP app (`app.py`), per-dataset packages (`private_residential/`: `filters.py`, `repository.py`, `service.py`) and MCP adapters (`tools/`, `prompts/`, `resources/`) |
+| `src/sg_mcproperty/accessor.py` | `ClickHouseAccessor`: read-only parameterised queries used by repositories |
 | `src/sg_mcproperty/{config,db}.py` | Env-based settings and the shared ClickHouse client factory |
 | `data/` | Raw downloads, gitignored (only `.gitkeep` is tracked) |
 | `tests/` | Mirrors `src/` (`loaders/`, `server/`) |
@@ -45,12 +46,16 @@ uv run ruff check . && uv run ruff format .
 - **Loaders split `transform` (pure polars, unit-tested) from `load` (I/O).** Read source
   CSVs as all-strings and cast explicitly in `transform`. Register new loaders in
   `loaders/cli.py`.
-- **MCP tools are read-only and parameterised.** Use `get_client(readonly=True)` and
+- **MCP server code is layered: adapters (`tools/`, `prompts/`, `resources/`) -> service ->
+  repository -> accessor.** Each layer only calls the one below. Adapters hold no SQL or rules.
+  **Before adding or changing any tool, prompt or resource, use the `add-mcp-tool` skill**
+  (`.claude/skills/add-mcp-tool/SKILL.md`); it has the layer rules, steps, tests and review
+  checklist. Details for the folder are in `src/sg_mcproperty/server/CLAUDE.md`.
+- **MCP tools are read-only and parameterised.** Use the read-only `ClickHouseAccessor` and
   ClickHouse `{name:Type}` query parameters; never interpolate user/LLM input into SQL. Do
   not add a free-form "run SQL" tool without discussing it first.
-- Tool docstrings are what the LLM sees: state units (SGD, sqm), valid filter values, and
-  defaults. Add one `tools/<topic>.py` per area exposing `register(mcp)`, then call it in
-  `server/app.py`.
+- Tool docstrings are what the LLM sees: state units (SGD, sqft), valid filter values, and
+  defaults. Try tools with `python -m sg_mcproperty.server.dev_client`.
 - Prices are SGD. HDB `month` is stored as the first day of the month.
 
 ## Datasets
