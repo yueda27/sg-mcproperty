@@ -57,3 +57,7 @@ def migrate(settings: Settings | None = None, directory: Path = MIGRATIONS_DIR) 
 def main() -> None:
     ran = migrate()
     print("Applied: " + ", ".join(ran) if ran else "Already up to date.", file=sys.stdout)
+
+
+if __name__ == "__main__":
+    main()
