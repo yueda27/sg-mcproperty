@@ -4,11 +4,13 @@ MCP layer on Singapore property transaction data stored in ClickHouse.
 
 ```
 URA API --(sg-property-load --dump)--> output/*.parquet --(to_clickhouse)--> ClickHouse
-                                                     migrations define schema ^
+                                                     migrations define schema ^   |
+                                                              MCP server (read-only) <-- MCP client / LLM
 ```
 
 Status: private residential transactions are fetched, transformed, dumped to parquet and
-loaded into ClickHouse. The MCP tools are not written yet (see [TODO](#todo)).
+loaded into ClickHouse. The MCP server has two tools (`search_projects`, `search_transactions`),
+two prompts and two resources for that dataset. More tools are planned (see [TODO](#todo)).
 
 ## 1. Prerequisites
 
@@ -122,25 +124,78 @@ curl -s "localhost:8123/?user=default" --data \
    FROM sg_property.private_residential_transactions FORMAT TSVWithNames"
 ```
 
-## 7. Cursor / VS Code launch configurations
+## 7. Run the MCP server
 
-`.vscode/launch.json` is gitignored, so it is local. It has three configurations, all using the
+```bash
+uv run sg-property-mcp        # stdio MCP server, read-only against ClickHouse
+```
+
+What it exposes for private residential data:
+
+| Kind | Name | Purpose |
+|---|---|---|
+| Tool | `search_projects` | Find exact project names from a fuzzy or misspelled name, optionally by district |
+| Tool | `search_transactions` | List transactions, newest first, filtered by project, district, sale type, dates, price and area (capped at 100 rows, reports `total_matches`) |
+| Prompt | `project_overview` | Guides the model through summarising one project's recent sales |
+| Prompt | `recent_deals` | Guides the model through listing notable sales in a district |
+| Resource | `property://private-residential/schema` | Column meanings, units and caveats |
+| Resource | `property://private-residential/coverage` | Live row count, project count and date range |
+
+### Trying the tools without an MCP client
+
+```bash
+python -m sg_mcproperty.server.dev_client list
+python -m sg_mcproperty.server.dev_client call search_projects name_query=parktown district=18
+python -m sg_mcproperty.server.dev_client call search_transactions project=aurea start_date=2026-01 limit=5
+python -m sg_mcproperty.server.dev_client --transport stdio call search_projects name_query=aurea
+```
+
+The default `memory` transport runs the server inside the same process, so breakpoints in tool
+code are hit under the debugger. `--transport stdio` starts a real server subprocess. Arguments
+are `key=value` pairs or one JSON object. Run it with the `.env` variables exported.
+
+### How the server code is layered
+
+```
+server/tools | prompts | resources   MCP adapters: signatures, docstrings, one call each
+        v
+server/private_residential/service.py      validation, limits, typed results
+        v
+server/private_residential/repository.py   SQL templates and parameters
+        v
+accessor.py (ClickHouseAccessor)           read-only ClickHouse connection
+```
+
+`server/private_residential/filters.py` holds the pure input handling (normalising names,
+validating districts and dates, building the `WHERE` clause). `server/app.py` wires the layers
+together. SQL values always go through `{name:Type}` parameters, never string formatting.
+
+## 8. Cursor / VS Code launch configurations
+
+`.vscode/launch.json` is gitignored, so it is local. It has five configurations, all using the
 `.venv` interpreter and loading `.env`:
 
 - **Load: private-residential**: `sg_mcproperty.loaders.cli private-residential --dump`
 - **Load output -> ClickHouse: private-residential**: `sg_mcproperty.loaders.to_clickhouse`
 - **Migrate: ClickHouse**: `sg_mcproperty.migrate`
+- **MCP dev client: list tools** and **MCP dev client: call tool**: `sg_mcproperty.server.dev_client`
+  (edit the `args` of the second one to try other tools)
 
 Run these modules with `-m` or from the Run and Debug panel. Running a file such as `migrate.py`
 with the play button fails with `ImportError: attempted relative import with no known parent
 package`, because the code uses package-relative imports.
 
-## 8. Tests and lint
+## 9. Tests and lint
 
 ```bash
-uv run pytest tests/loaders/test_private_residential.py
+uv run pytest tests/server tests/loaders/test_private_residential.py
 uv run ruff check . && uv run ruff format .
 ```
+
+`tests/server/private_residential/` mirrors the source (`test_filters.py`, `test_repository.py`,
+`test_service.py`). The service tests use a fake repository and the repository tests use a fake
+accessor, so most tests need no database. A few tests run against live ClickHouse and skip
+themselves when it is not running or the table is empty.
 
 `tests/loaders/test_hdb_resale.py` currently fails at collection because the `hdb_resale`
 loader does not exist in this repo.
@@ -157,6 +212,12 @@ loader does not exist in this repo.
 | `src/sg_mcproperty/loaders/to_clickhouse.py` | Parquet to ClickHouse |
 | `src/sg_mcproperty/loaders/utils.py` | `output/` path and `dump_file` |
 | `src/sg_mcproperty/{config,db}.py` | Env settings and ClickHouse client factory |
+| `src/sg_mcproperty/accessor.py` | `ClickHouseAccessor`: read-only parameterised queries |
+| `src/sg_mcproperty/server/app.py` | MCP server entry point and wiring (`sg-property-mcp`) |
+| `src/sg_mcproperty/server/private_residential/` | `filters.py`, `repository.py`, `service.py` for the dataset |
+| `src/sg_mcproperty/server/{tools,prompts,resources}/` | MCP adapters, one module per dataset |
+| `src/sg_mcproperty/server/dev_client.py` | Terminal client for trying tools during development |
+| `tests/server/` | Server tests, mirroring the source layout |
 | `output/` | Parquet dumps (gitignored) |
 | `clickhouse_db/` | Local ClickHouse server data (gitignored) |
 
@@ -164,6 +225,9 @@ loader does not exist in this repo.
 
 1. ~~Setup loading script~~ done for private residential. HDB resale loader still to do
 2. ~~Setup tables~~ done for private residential
-3. Setup MCP tools (read-only, parameterised) in `src/sg_mcproperty/server/tools/`
-4. Add URA rental contracts (`noOfBedRoom`) to estimate bedrooms per transaction
-5. Optional `--load` flag on `sg-property-load` to dump and insert in one command
+3. ~~Setup MCP tools~~ `search_projects` and `search_transactions` done. Still planned:
+   `dataset_info`, `price_trend`, `project_summary`, `compare`, `rank_projects`,
+   `market_activity`, `find_comparables`, `affordability_search`
+4. Keep URA `propertyType`, `typeOfArea` and `marketSegment` in `flatten` (landed versus condo)
+5. Add URA rental contracts (`noOfBedRoom`) to estimate bedrooms per transaction
+6. Optional `--load` flag on `sg-property-load` to dump and insert in one command

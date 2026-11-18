@@ -119,9 +119,7 @@ def transform(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("project").str.strip_chars(),
         pl.col("street").str.strip_chars(),
         (pl.col("area").cast(pl.Float64) * SQM_TO_SQFT).alias("area_sqft"),
-        pl.col("floorRange")
-        .map_elements(floor_midpoint, return_dtype=pl.Int64)
-        .alias("floor"),
+        pl.col("floorRange").map_elements(floor_midpoint, return_dtype=pl.Int64).alias("floor"),
         pl.col("contractDate")
         .str.strip_chars()
         .str.strptime(pl.Datetime, "%m%y")

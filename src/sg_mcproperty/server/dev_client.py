@@ -75,7 +75,8 @@ async def list_tools(client: Client) -> None:
 
 async def call_tool(client: Client, name: str, arguments: dict[str, Any]) -> None:
     result = await client.call_tool(name, arguments)
-    data = result.data if result.data is not None else result.content
+    # structured_content is the plain JSON the server returned (lists are wrapped in {"result": ...})
+    data = result.structured_content if result.structured_content is not None else result.content
     print(json.dumps(data, indent=2, default=str))
 
 

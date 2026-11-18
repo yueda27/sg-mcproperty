@@ -1,7 +1,7 @@
 """Thin accessor over ClickHouse for running parameterised queries."""
 
 import re
-from typing import Any
+from typing import Any, Protocol
 
 from clickhouse_connect.driver.exceptions import ClickHouseError
 
@@ -9,6 +9,14 @@ from .config import Settings
 from .db import get_client
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class Queryable(Protocol):
+    """What repositories need from the database layer (lets tests pass a fake)."""
+
+    def table(self, name: str) -> str: ...
+
+    def query(self, sql: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]: ...
 
 
 class ClickHouseAccessor:
